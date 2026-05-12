@@ -450,6 +450,25 @@ class DashboardPage(ctk.CTkFrame):
             command=self.app.go_settings,
         ).pack(fill="x", pady=2)
 
+        # v1.8.14 UX: "คู่มือ" deep-links to the customer-facing Google
+        # Drive folder where admin posts the full Thai manual + video
+        # walkthroughs + FAQ updates. Lives right under the Settings
+        # button because customers who didn't read the in-bundle
+        # ``MANUAL_TH.md`` reliably end up scrolling the sidebar
+        # looking for "where's the help" — putting it next to
+        # Settings groups all the "system-level info" affordances.
+        # The URL is checked into the source because the Drive
+        # folder ID is public-share-readable and rotating it would
+        # require a code change anyway (no point in a config knob).
+        _ghost_button(
+            foot,
+            "📖  คู่มือ",
+            command=lambda: webbrowser.open(
+                "https://drive.google.com/drive/folders/"
+                "1l-V0ZWWdGP5rQcqt3OQbuhmagFO2WZvE",
+            ),
+        ).pack(fill="x", pady=2)
+
         # v1.8.14 UX: the "🔄 รีสตาร์ท ADB" button moved out of
         # this sidebar foot into the device header_card's title_row
         # (right under the "🗑️ ลบเครื่อง" button). Reason: customers

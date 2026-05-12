@@ -103,6 +103,7 @@ ADMIN_TOOLS: set[str] = {
     "smoke_test.sh",
     "build_installer.bat",
     "build_dmg.sh",
+    "build_macos_pkg.sh",
     # Inno Setup script + EULA -- both are part of the *installer*
     # build pipeline (run on admin host), never shipped to customers.
     # Inside the installer the EULA gets renamed to LICENSE_TH.txt
