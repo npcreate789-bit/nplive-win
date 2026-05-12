@@ -243,12 +243,31 @@ def _add_prebuilt_app(
     import os
 
     n = 0
+    # v1.8.13 leak fix: any developer who tested the .app locally
+    # accumulates runtime files inside Contents/MacOS — logs from
+    # _startup_diagnostic.py, update_prefs.json from the new
+    # UpdatePrefs cache, npcreate.log, .DS_Store from Finder. Those
+    # files leak into the customer ZIP if we naively walk the .app
+    # tree. Skip the well-known runtime locations (same names the
+    # repo-level _SHIP_SKIP_NAMES already excludes) so the shipped
+    # bundle is reproducible byte-for-byte regardless of how often
+    # the admin tested the .app before zipping.
+    _APP_RUNTIME_SKIP = {
+        "logs", "cache", "videos",
+        "__pycache__", ".DS_Store", "Thumbs.db",
+    }
     if os_name == "macos":
         app_dir = prebuilt_dir / "NP-Create.app"
         if not app_dir.is_dir():
             return 0
         for dirpath, dirnames, filenames in os.walk(app_dir, followlinks=False):
+            # Prune runtime dirs early — directories rather than
+            # individual files because logs/ holds many rotating
+            # log files and listing each by name would miss new ones.
+            dirnames[:] = [d for d in dirnames if d not in _APP_RUNTIME_SKIP]
             for fname in dirnames + filenames:
+                if fname in _APP_RUNTIME_SKIP:
+                    continue
                 full = Path(dirpath) / fname
                 rel = full.relative_to(prebuilt_dir).as_posix()
                 arcname = f"{prefix}/app/{rel}"
@@ -503,7 +522,19 @@ def _windows_install_thai() -> str:
 # ── README generation ────────────────────────────────────────────
 
 
-def _readme(target: str, os_name: str) -> str:
+def _readme(target: str, os_name: str, *, has_prebuilt_app: bool = False) -> str:
+    """Generate the customer-facing README inside the ZIP.
+
+    ``has_prebuilt_app`` flips the install instructions: when the
+    bundle ships a PyInstaller .app/.exe alongside the Python tree,
+    we lead with the native binary (customer doesn't need Python
+    installed at all) and demote ``run.bat`` / ``run.command`` to
+    a "power-user fallback" footnote. When no prebuilt is present
+    the README falls back to the legacy run.bat/.command flow that
+    pre-dates v1.8.13 — bit-for-bit identical so admin can still
+    ship a Python-only bundle if they need to skip the PyInstaller
+    step for any reason.
+    """
     is_admin = target == "admin"
     title = (
         f"{BRAND.name} — Admin Bundle"
@@ -528,36 +559,87 @@ def _readme(target: str, os_name: str) -> str:
         ### Build customer bundle
 
         ```
+        # Python-only bundle (smaller zip, customer needs Python 3.13):
         python tools/build_release.py --target customer --os windows
         python tools/build_release.py --target customer --os macos
+
+        # With native binary (zero-dependency, ~80 MB larger zip):
+        python tools/build_release.py --target customer --os macos --with-app
         ```
         ผลลัพธ์อยู่ใน `dist/`
         """)
-    launcher_step = (
-        "ดับเบิ้ลคลิก `run.bat`"
-        if os_name == "windows"
-        else "ดับเบิ้ลคลิก `run.command`"
-    )
-    sec_install = textwrap.dedent(f"""\
-        ## เริ่มต้นใช้งานเร็ว ๆ (Quick Start)
 
-        1. ลง **Python 3.13** จาก https://www.python.org/downloads
-           {'(สำคัญ: ติ๊ก "Add Python to PATH" ตอนลง)' if os_name == 'windows' else ''}
-        2. แตก zip นี้ไว้ที่ Desktop
-        3. {launcher_step}
-        4. รอ ~30 วินาที (ติดตั้งส่วนประกอบครั้งแรก)
-        5. กรอก License Key → กด "เปิดใช้งาน"
-        6. เสียบ USB มือถือ → กด "เพิ่มเครื่องใหม่" → ทำตาม Wizard
+    if has_prebuilt_app:
+        # Lead with the native binary — no Python installation needed.
+        # The .app sits at ``<bundle>/app/NP-Create.app`` (macOS) or
+        # ``<bundle>/app/NP-Create.exe`` (Windows); see ``_add_prebuilt_app``
+        # for why we nest under ``app/`` (the production layout that
+        # ``platform_tools._tools_root_base`` is built for).
+        binary_name = (
+            "app/NP-Create.exe" if os_name == "windows"
+            else "app/NP-Create.app"
+        )
+        sec_install = textwrap.dedent(f"""\
+            ## เริ่มต้นใช้งานเร็ว ๆ (Quick Start) ⚡
 
-        > **อ่านคู่มือฉบับเต็ม** ใน `MANUAL_TH.md` (วิธีต่อ WiFi, แก้ปัญหา,
-        > FAQ และอื่น ๆ ครบทุกข้อ)
+            **วิธีง่ายที่สุด — ไม่ต้องลง Python**
 
-        ## ติดต่อแอดมิน
+            1. แตก zip นี้ไว้ที่ Desktop
+            2. ดับเบิ้ลคลิก `{binary_name}` (ใช้งานได้ทันที)
+            3. กรอก License Key → กด "เปิดใช้งาน"
+            4. เสียบ USB มือถือ → กด "เพิ่มเครื่องใหม่" → ทำตาม Wizard
 
-        - Line OA: **{BRAND.line_oa}**
-        - เวลาทำการ: {BRAND.support_hours}
-        - **ส่งภาพหน้าจอ + ข้อความ error** จะแก้ให้เร็วขึ้น
-        """)
+            > **อ่านคู่มือฉบับเต็ม** ใน `MANUAL_TH.md` (วิธีต่อ WiFi, แก้ปัญหา,
+            > FAQ และอื่น ๆ ครบทุกข้อ)
+
+            ### ทางเลือก: ใช้ Python ของตัวเอง (ขั้นสูง)
+
+            ถ้าคุณติดตั้ง Python 3.13 ไว้แล้ว และอยากใช้ตัวนั้นแทน:
+
+            1. ลง Python 3.13 จาก https://www.python.org/downloads
+               {'(สำคัญ: ติ๊ก "Add Python to PATH" ตอนลง)' if os_name == 'windows' else ''}
+            2. ดับเบิ้ลคลิก `{'run.bat' if os_name == 'windows' else 'run.command'}` แทน
+            3. รอ ~30 วินาที (ติดตั้ง dependencies ครั้งแรก)
+
+            > วิธีนี้ใช้สำหรับ debug หรือทดสอบเวอร์ชัน Python ที่เฉพาะเจาะจง.
+            > ลูกค้าทั่วไปแนะนำให้ใช้ `{binary_name}` ด้านบนเพราะง่ายกว่า.
+
+            ## ติดต่อแอดมิน
+
+            - Line OA: **{BRAND.line_oa}**
+            - เวลาทำการ: {BRAND.support_hours}
+            - **ส่งภาพหน้าจอ + ข้อความ error** จะแก้ให้เร็วขึ้น
+            """)
+    else:
+        # Legacy Python-only path (pre-v1.8.13 ship layout). Kept
+        # bit-for-bit identical so a fall-back ZIP without the
+        # PyInstaller bundle still reads exactly like v1.8.12 did.
+        launcher_step = (
+            "ดับเบิ้ลคลิก `run.bat`"
+            if os_name == "windows"
+            else "ดับเบิ้ลคลิก `run.command`"
+        )
+        sec_install = textwrap.dedent(f"""\
+            ## เริ่มต้นใช้งานเร็ว ๆ (Quick Start)
+
+            1. ลง **Python 3.13** จาก https://www.python.org/downloads
+               {'(สำคัญ: ติ๊ก "Add Python to PATH" ตอนลง)' if os_name == 'windows' else ''}
+            2. แตก zip นี้ไว้ที่ Desktop
+            3. {launcher_step}
+            4. รอ ~30 วินาที (ติดตั้งส่วนประกอบครั้งแรก)
+            5. กรอก License Key → กด "เปิดใช้งาน"
+            6. เสียบ USB มือถือ → กด "เพิ่มเครื่องใหม่" → ทำตาม Wizard
+
+            > **อ่านคู่มือฉบับเต็ม** ใน `MANUAL_TH.md` (วิธีต่อ WiFi, แก้ปัญหา,
+            > FAQ และอื่น ๆ ครบทุกข้อ)
+
+            ## ติดต่อแอดมิน
+
+            - Line OA: **{BRAND.line_oa}**
+            - เวลาทำการ: {BRAND.support_hours}
+            - **ส่งภาพหน้าจอ + ข้อความ error** จะแก้ให้เร็วขึ้น
+            """)
+
     sections = [
         f"# {title}\n\nเวอร์ชัน {BRAND.version}\n",
         sec_install,
@@ -753,7 +835,6 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
         info.external_attr = (0o100755 << 16) if os_name != "windows" else (0o100644 << 16)
         info.compress_type = zipfile.ZIP_DEFLATED
         zf.writestr(info, body)
-        zf.writestr(f"{prefix}/README_TH.md", _readme(target, os_name))
 
         # ── prebuilt .app/.exe (optional) ───────────────────────
         # If the admin ran `tools/build_pyinstaller.py` first, we
@@ -763,10 +844,33 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
         #   • Or run.bat / run.command — uses their installed Python
         # We never *require* the prebuilt; missing is OK.
         prebuilt_dir = PROJECT / "dist" / "pyinstaller"
+        has_prebuilt_app = False
         if prebuilt_dir.is_dir():
             n_pre = _add_prebuilt_app(zf, prebuilt_dir, prefix, os_name)
             if n_pre:
+                has_prebuilt_app = True
                 print(f"   app/    : {n_pre} files (PyInstaller bundle)")
+            elif os_name in ("macos", "windows"):
+                # The dist/pyinstaller dir exists but doesn't carry
+                # an artifact for this OS — common when the admin
+                # built the .app on Mac and is now packing a Windows
+                # ZIP (PyInstaller can't cross-build). Flag it so
+                # the resulting ZIP's README + launcher copy reflects
+                # the Python-only flow, not the misleading
+                # "double-click NP-Create.exe" copy.
+                print(
+                    f"   app/    : (no {os_name} artifact in "
+                    f"dist/pyinstaller — Python-only bundle)"
+                )
+
+        # README is written AFTER the prebuilt-detection probe so its
+        # copy can match what the ZIP actually contains. Customer
+        # opening a Python-only bundle gets the legacy run.bat copy;
+        # one with the .app/.exe gets the "just double-click" lead.
+        zf.writestr(
+            f"{prefix}/README_TH.md",
+            _readme(target, os_name, has_prebuilt_app=has_prebuilt_app),
+        )
 
         # ── Windows-only Thai install fallback (INSTALL_TH.txt) ─
         # The .bat itself is ASCII-only (cmd.exe parses with the
@@ -795,6 +899,47 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
     return out_zip
 
 
+def _ensure_prebuilt_app() -> bool:
+    """Run ``tools/build_pyinstaller.py`` if the host OS's prebuilt
+    artifact isn't already on disk. Returns True on success (or no-op
+    when the artifact already exists), False on build failure.
+
+    PyInstaller doesn't cross-build, so calling this from a macOS
+    host can ONLY produce ``NP-Create.app`` — Windows ZIPs built on
+    the same host won't gain an ``NP-Create.exe`` from this call.
+    The build_one() probe correctly downgrades those ZIPs to the
+    Python-only README, so the only loss is that customer Windows
+    ZIPs aren't binary-ready until CI (or the admin) packs them on
+    a Windows host.
+    """
+    prebuilt_dir = PROJECT / "dist" / "pyinstaller"
+    host_artifact = (
+        prebuilt_dir / "NP-Create.app" if sys.platform == "darwin"
+        else prebuilt_dir / "NP-Create.exe"
+    )
+    if host_artifact.exists():
+        print(f"[i] prebuilt already on disk: {host_artifact}")
+        return True
+
+    print(f"[i] running tools/build_pyinstaller.py "
+          f"(produces {host_artifact.name} for this host)...")
+    builder = HERE / "build_pyinstaller.py"
+    if not builder.is_file():
+        print(f"[!] {builder} missing — can't bootstrap prebuilt", file=sys.stderr)
+        return False
+    try:
+        import subprocess
+        subprocess.run(
+            [sys.executable, str(builder)],
+            cwd=str(PROJECT), check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"[!] build_pyinstaller failed (exit {exc.returncode})",
+              file=sys.stderr)
+        return False
+    return host_artifact.exists()
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument(
@@ -808,12 +953,28 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--all", action="store_true",
                    help="build all four combinations")
     p.add_argument(
+        "--with-app", action="store_true",
+        help="run tools/build_pyinstaller.py first so the resulting "
+             "ZIP bundles a double-clickable NP-Create.app/.exe — "
+             "customer doesn't need to install Python at all "
+             "(PyInstaller cannot cross-build, so this only adds the "
+             "binary for the current host OS).",
+    )
+    p.add_argument(
         "--dist", default=str(WORKSPACE / "dist"),
         help="output directory (default: <workspace>/dist)",
     )
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
 
     dist = Path(args.dist).resolve()
+
+    if args.with_app:
+        if not _ensure_prebuilt_app():
+            print(
+                "[!] --with-app requested but prebuilt couldn't be built. "
+                "Falling back to Python-only ZIPs; see error above.",
+                file=sys.stderr,
+            )
 
     if args.all:
         outs = []
