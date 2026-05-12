@@ -450,24 +450,18 @@ class DashboardPage(ctk.CTkFrame):
             command=self.app.go_settings,
         ).pack(fill="x", pady=2)
 
-        # ── Quick "restart adb" — v1.8.1 customer ask.
-        # Returning customers regularly hit the symptom "phone
-        # plugged in but every device card on the dashboard says
-        # offline" because some other process (scrcpy / Vysor /
-        # Android Studio left running in the background, or the
-        # OS USB stack after sleep/wake) is holding adb's port-5037
-        # daemon hostage. The wizard already has a 🔄 button buried
-        # in step 1, but customers in this state aren't *trying* to
-        # add a device — they're trying to use the dashboard with
-        # one they already onboarded. So put the same action one
-        # click away from the very page where the "everything
-        # offline" symptom presents.
-        self.btn_restart_adb = _ghost_button(
-            foot,
-            "🔄  รีสตาร์ท ADB",
-            command=self._on_restart_adb,
-        )
-        self.btn_restart_adb.pack(fill="x", pady=2)
+        # v1.8.14 UX: the "🔄 รีสตาร์ท ADB" button moved out of
+        # this sidebar foot into the device header_card's title_row
+        # (right under the "🗑️ ลบเครื่อง" button). Reason: customers
+        # hit the "all phones offline" symptom IN the device header
+        # area itself, so grouping the recovery action with the
+        # other device-row actions (rename / delete) gives them a
+        # single visual cluster of "device-management buttons" on
+        # the right edge of the header. See ``_build_main`` for the
+        # new creation site. The handler (``_on_restart_adb``) is
+        # unchanged and the ``btn_restart_adb`` attribute name is
+        # preserved so the existing configure() calls in
+        # ``_on_restart_adb`` keep working.
 
         # ── Dashboard launcher
         # Spins up the FastAPI server (lazy import + lazy start so a
@@ -830,6 +824,33 @@ class DashboardPage(ctk.CTkFrame):
             command=self._on_delete_device,
         )
         self.btn_delete_device.grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+        # v1.8.14: "🔄 รีสตาร์ท ADB" lives directly under "ลบเครื่อง"
+        # in the same right-edge column of title_row. Customers hit
+        # the "all devices offline" symptom IN the device-header area
+        # itself, so grouping the recovery action with the rest of
+        # the device-management cluster (rename / delete) means the
+        # eye doesn't have to leave the card to find it. Styling
+        # mirrors the rename/delete buttons (width=110, height=28,
+        # 11px font, transparent fill, neutral border) so the three
+        # right-aligned actions read as a single visual stack.
+        self.btn_restart_adb = ctk.CTkButton(
+            title_row,
+            text="🔄 รีสตาร์ท ADB",
+            width=140,
+            height=28,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=THEME.bg_hover,
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=11),
+            border_width=1,
+            border_color=THEME.border,
+            command=self._on_restart_adb,
+        )
+        self.btn_restart_adb.grid(
+            row=1, column=2, sticky="e", padx=(8, 0), pady=(6, 0),
+        )
 
         self.lbl_device_status = _muted(self.header_card, "—")
         self.lbl_device_status.grid(row=1, column=0, sticky="w", padx=20, pady=(2, 4))
