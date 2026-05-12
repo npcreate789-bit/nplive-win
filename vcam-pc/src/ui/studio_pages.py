@@ -914,28 +914,93 @@ class DashboardPage(ctk.CTkFrame):
         self._hook_status_cache: dict[str, tuple[float, object]] = {}
         self._hook_status_inflight: bool = False
 
-        # Video card
+        # v1.8.14 UX merge: "คลิปปัจจุบัน" + "ส่งคลิปไปเครื่อง"
+        # used to be two separate cards with rotation + audio
+        # sandwiched between them. The customer's natural flow is
+        # "look at clip → send it", but with 3 cards between the
+        # two buttons the eye had to scan past unrelated controls.
+        # Merging into one card puts ``เปลี่ยนคลิป...`` and
+        # ``▶ Encode + Push`` on the same row so the action chain
+        # is visually obvious. All widget references (``lbl_video_path``,
+        # ``btn_encode_push``, ``progress``, ``lbl_encode_status``) keep
+        # the same attribute names so callers in _on_pick_video,
+        # _on_encode_push, _render_encode_card_for, etc. don't need
+        # to change.
         vid = _card(main)
         vid.grid(row=3, column=0, sticky="ew", padx=20, pady=8)
         vid.grid_columnconfigure(0, weight=1)
         self.video_card = vid
+        # Backward-compat: code that referenced ``action_card`` (e.g.
+        # the per-device encode card renderer) now points at the
+        # merged card so its grid-row lookups land in the right place.
+        self.action_card = vid
 
         ctk.CTkLabel(
-            vid, text="📁  คลิปปัจจุบัน",
+            vid, text="🎬  ส่งคลิปไปเครื่อง",
             text_color=THEME.fg_primary,
             font=ctk.CTkFont(size=14, weight="bold"),
         ).grid(row=0, column=0, sticky="w", padx=20, pady=(16, 4))
 
-        self.lbl_video_path = _body(vid, "(ยังไม่ได้เลือกคลิป)", anchor="w", justify="left")
-        self.lbl_video_path.grid(row=1, column=0, sticky="ew", padx=20)
+        # Clip path + metadata — "what's currently selected".
+        _muted(vid, "คลิปปัจจุบัน:").grid(
+            row=1, column=0, sticky="w", padx=20, pady=(4, 0),
+        )
+        self.lbl_video_path = _body(
+            vid, "(ยังไม่ได้เลือกคลิป)", anchor="w", justify="left",
+        )
+        self.lbl_video_path.grid(row=2, column=0, sticky="ew", padx=20)
 
         self.lbl_video_meta = _muted(vid, "")
-        self.lbl_video_meta.grid(row=2, column=0, sticky="w", padx=20, pady=(2, 8))
+        self.lbl_video_meta.grid(
+            row=3, column=0, sticky="w", padx=20, pady=(2, 10),
+        )
+
+        # Description line for the Encode + Push action.
+        cfg = self.app.cfg
+        portrait_w = max(2, int(cfg.encode_height or 1080))
+        portrait_h = max(2, int(cfg.encode_width or 1920))
+        _muted(
+            vid,
+            f"กดปุ่ม ▶ ด้านขวาเพื่อ Encode คลิปเป็น MP4 "
+            f"{portrait_w}×{portrait_h} + push เข้าเครื่อง. "
+            "TikTok จะดึงไฟล์นี้ขึ้นไลฟ์.",
+        ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 8))
+
+        # Buttons row — choose-clip on the left, encode-push on the
+        # right. Side-by-side placement is the headline UX win for
+        # v1.8.14: customer sees both buttons at once and reads the
+        # flow as a single action ("look at clip → send").
+        btn_row = ctk.CTkFrame(vid, fg_color="transparent")
+        btn_row.grid(row=5, column=0, sticky="ew", padx=20, pady=(0, 4))
+        btn_row.grid_columnconfigure(0, weight=0)
+        btn_row.grid_columnconfigure(1, weight=1)
 
         _ghost_button(
-            vid, "เปลี่ยนคลิป...",
+            btn_row, "📂  เปลี่ยนคลิป...",
             command=self._on_pick_video,
-        ).grid(row=3, column=0, sticky="w", padx=20, pady=(0, 16))
+            width=170,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+
+        self.btn_encode_push = _primary_button(
+            btn_row, "▶  Encode + Push",
+            command=self._on_encode_push,
+        )
+        self.btn_encode_push.grid(row=0, column=1, sticky="ew")
+
+        # Progress + status — directly under the buttons so a click
+        # produces immediate visible feedback in the same card.
+        self.progress = ctk.CTkProgressBar(
+            vid, progress_color=THEME.primary,
+            fg_color=THEME.bg_input,
+            height=6,
+        )
+        self.progress.grid(row=6, column=0, sticky="ew", padx=20, pady=(8, 4))
+        self.progress.set(0.0)
+
+        self.lbl_encode_status = _muted(vid, "พร้อม")
+        self.lbl_encode_status.grid(
+            row=7, column=0, sticky="w", padx=20, pady=(0, 16),
+        )
 
         # Rotation card
         rot = _card(main)
@@ -1039,51 +1104,20 @@ class DashboardPage(ctk.CTkFrame):
         self.lbl_audio_status = _muted(aud, "")
         self.lbl_audio_status.grid(row=5, column=0, sticky="w", padx=20, pady=(0, 16))
 
-        # Action card (Encode + Push video)
-        act = _card(main)
-        act.grid(row=6, column=0, sticky="ew", padx=20, pady=8)
-        act.grid_columnconfigure(0, weight=1)
-        self.action_card = act
-
-        ctk.CTkLabel(
-            act, text="▶️  ส่งคลิปไปเครื่อง",
-            text_color=THEME.fg_primary,
-            font=ctk.CTkFont(size=14, weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=20, pady=(16, 4))
-
-        cfg = self.app.cfg
-        # Show landscape encode size as portrait (rotation cancels
-        # out on the phone so users see WxH portrait on screen).
-        portrait_w = max(2, int(cfg.encode_height or 1080))
-        portrait_h = max(2, int(cfg.encode_width or 1920))
-        _muted(
-            act,
-            f"Encode คลิปเป็น MP4 {portrait_w}×{portrait_h} + push เข้าเครื่อง. "
-            "TikTok ในโทรศัพท์จะดึงไฟล์นี้ขึ้นไลฟ์.",
-        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 8))
-
-        self.btn_encode_push = _primary_button(
-            act, "▶  Encode + Push",
-            command=self._on_encode_push,
-        )
-        self.btn_encode_push.grid(row=2, column=0, sticky="ew", padx=20, pady=4)
-
-        self.progress = ctk.CTkProgressBar(
-            act, progress_color=THEME.primary,
-            fg_color=THEME.bg_input,
-            height=6,
-        )
-        self.progress.grid(row=3, column=0, sticky="ew", padx=20, pady=(8, 4))
-        self.progress.set(0.0)
-
-        self.lbl_encode_status = _muted(act, "พร้อม")
-        self.lbl_encode_status.grid(row=4, column=0, sticky="w", padx=20, pady=(0, 16))
+        # v1.8.14: the standalone "Action card (Encode + Push)" used
+        # to live at row=6 here. We merged its contents into the
+        # video card up at row=3 so customers see "เลือกคลิป" and
+        # "Encode + Push" on the same row instead of having to scan
+        # past rotation + audio cards to find the send button. All
+        # widget references (btn_encode_push / progress /
+        # lbl_encode_status / action_card) keep their attribute
+        # names — see the merged block at row=3 above.
 
         # Live-control card -- the customer's daily-driver button.
         # Driving start/stop from the PC saves them walking between
         # 5 phones tapping things on each.
         live_ctrl = _card(main)
-        live_ctrl.grid(row=7, column=0, sticky="ew", padx=20, pady=(8, 8))
+        live_ctrl.grid(row=6, column=0, sticky="ew", padx=20, pady=(8, 8))
         live_ctrl.grid_columnconfigure(0, weight=1)
         self.live_ctrl_card = live_ctrl
         self._build_live_control_card(live_ctrl)
@@ -1093,7 +1127,7 @@ class DashboardPage(ctk.CTkFrame):
         # at the bottom; the live-control card above is the one
         # the customer reaches for daily.
         live = _card(main)
-        live.grid(row=8, column=0, sticky="ew", padx=20, pady=(8, 24))
+        live.grid(row=7, column=0, sticky="ew", padx=20, pady=(8, 24))
         live.grid_columnconfigure(0, weight=1)
         live.grid_columnconfigure(1, weight=1)
         self.live_card = live
