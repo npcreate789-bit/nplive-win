@@ -1141,6 +1141,73 @@ class DashboardPage(ctk.CTkFrame):
             sticky="ew", padx=20, pady=(0, 16),
         )
 
+        # v1.8.14: Patch progress widgets. Initially hidden; shown
+        # only while a Patch is in flight. Sits across both columns
+        # below the buttons so a customer scanning the card after
+        # clicking can read the live "X% — {message}" line without
+        # the button moving.
+        self.upd_patch_progress = ctk.CTkProgressBar(
+            live,
+            progress_color=THEME.primary,
+            fg_color=THEME.bg_input,
+            height=6,
+        )
+        self.upd_patch_progress.set(0.0)
+        self.upd_patch_progress.grid(
+            row=2, column=0, columnspan=2,
+            sticky="ew", padx=20, pady=(0, 4),
+        )
+        self.upd_patch_progress.grid_remove()
+
+        self.lbl_patch_progress = ctk.CTkLabel(
+            live, text="",
+            text_color=THEME.fg_muted,
+            font=ctk.CTkFont(size=11),
+            anchor="w", justify="left",
+        )
+        self.lbl_patch_progress.grid(
+            row=3, column=0, columnspan=2,
+            sticky="ew", padx=20, pady=(0, 12),
+        )
+        self.lbl_patch_progress.grid_remove()
+
+    def _show_patch_progress(self) -> None:
+        """Reveal the progress bar + label, reset to 0%. Called
+        on Patch start. Idempotent — safe to call multiple times
+        on accidental double-clicks (the click guard on btn_patch
+        is the real lock; this just ensures we always start clean)."""
+        try:
+            self.upd_patch_progress.set(0.0)
+            self.upd_patch_progress.grid()
+            self.lbl_patch_progress.configure(text="กำลังเริ่มต้น...")
+            self.lbl_patch_progress.grid()
+        except Exception:
+            log.debug("show_patch_progress failed", exc_info=True)
+
+    def _hide_patch_progress(self) -> None:
+        """Tuck both widgets away after the Patch flow finishes
+        (success or failure). Keeps the live card layout clean
+        between Patch runs."""
+        try:
+            self.upd_patch_progress.grid_remove()
+            self.lbl_patch_progress.grid_remove()
+        except Exception:
+            log.debug("hide_patch_progress failed", exc_info=True)
+
+    def _update_patch_progress(self, pct: float, msg: str) -> None:
+        """Tk-thread receiver for the lspatch_pipeline progress
+        callbacks. Always trampoline through ``self.after(0, ...)``
+        from the worker thread — Tk widgets are not safe to touch
+        from a daemon thread.
+        """
+        try:
+            self.upd_patch_progress.set(max(0.0, min(1.0, float(pct))))
+            self.lbl_patch_progress.configure(
+                text=f"{int(pct * 100)}% — {msg}",
+            )
+        except Exception:
+            log.debug("update_patch_progress failed", exc_info=True)
+
     # ── auto-update banner ────────────────────────────────────────
 
     def _build_update_banner(self, parent: ctk.CTkFrame) -> None:
@@ -4046,6 +4113,10 @@ class DashboardPage(ctk.CTkFrame):
         ):
             return
         self.btn_patch.configure(state="disabled", text="กำลัง patch…")
+        # v1.8.14: surface live progress under the button so the
+        # customer never has to wonder whether the app froze (the
+        # #1 pre-fix support ticket: "กดแล้วไม่มีอะไรเกิดขึ้น").
+        self._show_patch_progress()
         threading.Thread(
             target=self._run_patch,
             args=(e.serial,),
@@ -4137,7 +4208,33 @@ class DashboardPage(ctk.CTkFrame):
         ls = self.app.lspatch
         patched_version = ""
         patched_signature = ""
+
+        # v1.8.14: stage-banded progress callback. The pipeline emits
+        # each stage's pct in [0, 1]; we re-map into the overall
+        # 0..1 timeline so a 50-split TikTok's pull → patch → install
+        # flow paints a smooth bar that never resets.
+        #
+        # Stage band allocation (matches the worst-case durations on
+        # a Redmi 13C / Helio G85 in production traces):
+        #   probe   : 0.00..0.03  (fast tool check)
+        #   pull    : 0.03..0.40  (~25 s — dominated by adb pull of
+        #                          the 200+ MB TikTok bundle)
+        #   patch   : 0.40..0.85  (~60 s — Java + lspatch)
+        #   install : 0.85..1.00  (~15 s — uninstall + adb install-multi)
+        def _emit_overall(pct: float, msg: str) -> None:
+            self.after(0, lambda p=pct, m=msg: self._update_patch_progress(p, m))
+
+        def _pull_cb(pct: float, msg: str) -> None:
+            _emit_overall(0.03 + pct * 0.37, msg)
+
+        def _patch_cb(pct: float, msg: str) -> None:
+            _emit_overall(0.40 + pct * 0.45, msg)
+
+        def _install_cb(pct: float, msg: str) -> None:
+            _emit_overall(0.85 + pct * 0.15, msg)
+
         try:
+            _emit_overall(0.01, "ตรวจสอบเครื่องมือ...")
             tools = ls.probe_tools()
             if not tools.ok:
                 self._patch_done(
@@ -4145,7 +4242,7 @@ class DashboardPage(ctk.CTkFrame):
                     "เครื่องมือไม่ครบ:\n" + "\n".join(tools.errors),
                 )
                 return
-            pull = ls.pull_tiktok(serial=serial)
+            pull = ls.pull_tiktok(serial=serial, progress_cb=_pull_cb)
             if not pull.ok:
                 # Translate the most common pull errors into customer
                 # language so they know exactly what to fix without
@@ -4164,7 +4261,7 @@ class DashboardPage(ctk.CTkFrame):
             # Capture the TikTok versionName we're about to patch so
             # the drift watcher can flag auto-updates later.
             patched_version = pull.version_name or ""
-            patched = ls.patch(pull.apks)
+            patched = ls.patch(pull.apks, progress_cb=_patch_cb)
             if not patched.ok:
                 self._patch_done(serial, False, f"patch ล้มเหลว: {patched.error}")
                 return
@@ -4177,6 +4274,7 @@ class DashboardPage(ctk.CTkFrame):
                 # bundle fails to install. This is what prevents the
                 # "Patch กดแล้ว TikTok หายไปจากเครื่อง" failure mode.
                 original_apks=pull.apks,
+                progress_cb=_install_cb,
             )
             if not inst.ok:
                 # Build a customer-friendly message that distinguishes
@@ -4235,6 +4333,11 @@ class DashboardPage(ctk.CTkFrame):
     ) -> None:
         def _ui():
             self.btn_patch.configure(state="normal")
+            # v1.8.14: tuck the progress widgets away regardless of
+            # ok / fail. Leaving them visible after a finished run
+            # would freeze the bar at the last-emitted % and confuse
+            # the customer on subsequent Patch clicks.
+            self._hide_patch_progress()
             if ok:
                 self.app.devices_lib.mark_patched(
                     serial,
@@ -6012,7 +6115,31 @@ class WizardPage(ctk.CTkFrame):
         ls = self.app.lspatch
         patched_version = ""
         patched_signature = ""
+
+        # v1.8.14: stage-banded progress updates surfaced via the
+        # existing ``lbl_patch_status`` label. Same band allocation
+        # as the dashboard's Patch button so customer support knows
+        # the percentages mean the same thing across both flows.
+        def _emit(pct_overall: float, msg: str) -> None:
+            text = f"{int(pct_overall * 100)}% — {msg}"
+            self.after(
+                0,
+                lambda t=text: self.lbl_patch_status.configure(
+                    text=t, text_color=THEME.fg_secondary,
+                ),
+            )
+
+        def _pull_cb(pct: float, msg: str) -> None:
+            _emit(0.03 + pct * 0.37, msg)
+
+        def _patch_cb(pct: float, msg: str) -> None:
+            _emit(0.40 + pct * 0.45, msg)
+
+        def _install_cb(pct: float, msg: str) -> None:
+            _emit(0.85 + pct * 0.15, msg)
+
         try:
+            _emit(0.01, "ตรวจสอบเครื่องมือ...")
             tools = ls.probe_tools()
             if not tools.ok:
                 self._wizard_patch_done(
@@ -6020,7 +6147,7 @@ class WizardPage(ctk.CTkFrame):
                     "เครื่องมือไม่ครบ:\n" + "\n".join(tools.errors),
                 )
                 return
-            pull = ls.pull_tiktok(serial=serial)
+            pull = ls.pull_tiktok(serial=serial, progress_cb=_pull_cb)
             if not pull.ok:
                 err_lower = (pull.error or "").lower()
                 if "no tiktok variant" in err_lower:
@@ -6033,7 +6160,7 @@ class WizardPage(ctk.CTkFrame):
                 self._wizard_patch_done(False, msg)
                 return
             patched_version = pull.version_name or ""
-            patched = ls.patch(pull.apks)
+            patched = ls.patch(pull.apks, progress_cb=_patch_cb)
             if not patched.ok:
                 self._wizard_patch_done(False, f"patch ล้มเหลว: {patched.error}")
                 return
@@ -6043,6 +6170,7 @@ class WizardPage(ctk.CTkFrame):
                 serial=serial,
                 # Same rollback safety net as the dashboard Patch button.
                 original_apks=pull.apks,
+                progress_cb=_install_cb,
             )
             if not inst.ok:
                 if inst.rollback_attempted and inst.rollback_ok:

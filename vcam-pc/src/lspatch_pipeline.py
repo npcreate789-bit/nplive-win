@@ -53,9 +53,11 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Optional
 
 from . import platform_tools
 from .config import PROJECT_ROOT, StreamConfig
@@ -66,6 +68,46 @@ from .config import PROJECT_ROOT, StreamConfig
 from .hook_status import TIKTOK_PACKAGES
 
 log = logging.getLogger(__name__)
+
+
+# ── v1.8.14: progress callbacks for the Patch flow ─────────────────
+#
+# Pre-v1.8.14 the customer clicked Patch and stared at a frozen
+# "กำลัง patch…" button for 2–5 minutes. Support tickets routinely
+# arrived 90 seconds in with "โปรแกรมค้าง" because the user assumed
+# the program had hung. The pipeline now accepts an optional
+# ``progress_cb`` on every long step (pull / patch / install) so the
+# UI can render a live "X% — {message}" line under the button. The
+# callback is ALWAYS optional (default None); pre-v1.8.14 callers
+# remain bit-for-bit identical, which is what keeps the existing
+# 31 tests in ``test_lspatch_install_rollback.py`` green without
+# any rewrites.
+#
+# Signature: ``progress_cb(pct: float in [0,1], message: str) -> None``
+# Callbacks fire from arbitrary threads (Popen reader threads on the
+# patch step), so the UI side trampolines through ``self.after(0, ...)``
+# before touching widgets.
+
+ProgressCB = Optional[Callable[[float, str], None]]
+
+
+def _fire_progress(cb: ProgressCB, pct: float, msg: str) -> None:
+    """Safe-fire a progress callback.
+
+    * Clamps ``pct`` to [0, 1] so a stage that overshoots its band
+      (e.g. patch finishes before the time-based estimator caught
+      up) can't push the bar past 100 % visually.
+    * Swallows every callback exception. A buggy UI handler (Tk
+      widget destroyed while we're still firing) must never break
+      the underlying pipeline — the customer would lose Patch
+      output for an avoidable reason.
+    """
+    if cb is None:
+        return
+    try:
+        cb(max(0.0, min(1.0, float(pct))), str(msg))
+    except Exception:
+        log.exception("lspatch progress callback raised")
 
 # Patterns we use to *discover* TikTok-like packages that aren't in
 # the hard-coded list above. Some OEM stores, beta channels, and
@@ -265,6 +307,7 @@ class LSPatchPipeline:
         self,
         package: str = "",
         serial: str | None = None,
+        progress_cb: ProgressCB = None,
     ) -> PullResult:
         """`adb pull` every APK that makes up TikTok into self.pulled_dir.
 
@@ -272,18 +315,36 @@ class LSPatchPipeline:
         feature modules). All of them must be patched and re-installed
         together, otherwise PackageManager refuses with
         INSTALL_FAILED_MISSING_SPLIT.
+
+        Progress callback contract
+        --------------------------
+        ``progress_cb`` (when not None) fires across [0, 1] within
+        this call. The outer Patch flow in the UI maps this band to
+        its 5..40 % slice so the customer sees a smoothly-moving bar
+        across all 4 stages. Update points:
+
+        * 0.02 → "ตรวจสอบ TikTok ในเครื่อง..."
+        * 0.05 → "เคลียร์ cache..."
+        * 0.10 → "หาตำแหน่งไฟล์ APK..."
+        * 0.15 → "อ่านเวอร์ชัน TikTok..."
+        * 0.20..0.90 → linear per-APK pull (1 base + N splits)
+        * 0.95 → "ตรวจสอบ LSPatched APK..."
+        * 1.00 → "ดึงไฟล์ครบ"
         """
+        _fire_progress(progress_cb, 0.02, "ตรวจสอบ TikTok ในเครื่อง...")
         if not package:
             package = self.detect_tiktok(serial)
         if not package:
             return PullResult(False, error="no TikTok variant installed")
 
         # Wipe the pull cache so we never mix old and new APKs.
+        _fire_progress(progress_cb, 0.05, "เคลียร์ cache เก่า...")
         if self.pulled_dir.exists():
             shutil.rmtree(self.pulled_dir)
         self.pulled_dir.mkdir(parents=True, exist_ok=True)
 
         # Each line of `pm path` is `package:/data/app/.../base.apk`.
+        _fire_progress(progress_cb, 0.10, "หาตำแหน่งไฟล์ APK บนเครื่อง...")
         out = self._adb_shell(f"pm path {package}", serial)
         paths = [
             line[len("package:"):].strip()
@@ -294,6 +355,7 @@ class LSPatchPipeline:
             return PullResult(False, package=package,
                               error="pm path returned no APKs")
 
+        _fire_progress(progress_cb, 0.15, "อ่านเวอร์ชัน TikTok...")
         version = self._adb_shell(
             f"dumpsys package {package} | grep -m1 versionName", serial
         )
@@ -303,8 +365,18 @@ class LSPatchPipeline:
         adb = self.cfg.adb_path
         t0 = time.monotonic()
         pulled: list[Path] = []
-        for p in paths:
+        total = max(1, len(paths))
+        for i, p in enumerate(paths):
             fname = p.rsplit("/", 1)[-1]
+            # Map the per-APK pull range to 0.20..0.90 so the band
+            # covers ~70 % of the pull stage. Customer with a 50-split
+            # TikTok sees a smoothly-incrementing bar instead of a
+            # 60-second jump from 15 % to 95 %.
+            pct = 0.20 + (i / total) * 0.70
+            _fire_progress(
+                progress_cb, pct,
+                f"ดึงไฟล์ {i + 1}/{total}: {fname}",
+            )
             dst = self.pulled_dir / fname
             cmd = [adb]
             if serial:
@@ -325,8 +397,10 @@ class LSPatchPipeline:
         # apkzlib chokes on the deeply-nested zip layout. Replacing the
         # outer wrapper with its embedded ``assets/lspatch/origin.apk``
         # gives us a clean base for the next round.
+        _fire_progress(progress_cb, 0.95, "ตรวจสอบไฟล์ LSPatched...")
         unwrapped = self._unwrap_lspatched(pulled)
 
+        _fire_progress(progress_cb, 1.0, f"ดึงไฟล์ครบ ({len(unwrapped)} APK)")
         return PullResult(
             ok=True,
             package=package,
@@ -433,19 +507,37 @@ class LSPatchPipeline:
         self,
         apks: list[Path],
         sigbypass_level: int = 2,
+        progress_cb: ProgressCB = None,
     ) -> PatchResult:
         """Run LSPatch over base + every split, embedding vcam-app.
 
         sigbypass_level=2 means LSPatch hooks both PackageManager AND
         openat() so TikTok's runtime self-signature checks see the
         original signature, not the LSPatch debug key.
+
+        Progress callback strategy
+        --------------------------
+        LSPatch's stdout is not standardised across releases and the
+        JAR sometimes flushes nothing until the very end, so a pure
+        line-parse approach would leave the customer staring at 5 %
+        for 60 seconds. Instead we run a background **ticker** that
+        interpolates progress over an expected duration based on the
+        number of APKs being patched (~1.5 s per APK + 15 s overhead,
+        derived from production traces on a 50-split TikTok). The
+        ticker is capped at 0.95 so we never claim 100 % until LSPatch
+        actually returns, and we ALSO parse stdout lines opportunistically:
+        any line containing ".apk" bumps the message to surface the
+        current filename. Result is a bar that fills smoothly and a
+        message that gives the customer something concrete to read.
         """
+        _fire_progress(progress_cb, 0.02, "ตรวจสอบเครื่องมือ (Java + lspatch)...")
         st = self.probe_tools()
         if not st.ok:
             return PatchResult(False, self.patched_dir,
                                error="; ".join(st.errors))
         assert st.java and st.lspatch and st.vcam_apk  # narrow for mypy
 
+        _fire_progress(progress_cb, 0.05, "เตรียม patch directory...")
         if self.patched_dir.exists():
             shutil.rmtree(self.patched_dir)
         self.patched_dir.mkdir(parents=True, exist_ok=True)
@@ -470,37 +562,162 @@ class LSPatchPipeline:
             extra_path=[st.java.parent] if st.java else None,
         )
 
+        # Expected duration (seconds). Production trace: ~1.5 s/APK +
+        # 15 s overhead. Cap at 600 s = subprocess timeout so we never
+        # promise more time than we'll wait. The ticker uses this to
+        # interpolate; over-/undershoot is fine because the ticker
+        # caps at 0.95 and the real return jumps to 1.0.
+        expected_s = min(600, max(20, int(len(apks) * 1.5 + 15)))
+        _fire_progress(
+            progress_cb, 0.08,
+            f"รัน LSPatch ({len(apks)} APK, ประมาณ {expected_s} วินาที)...",
+        )
+
+        # Fast path: when progress_cb is None we keep the v1.8.13
+        # behaviour bit-for-bit (subprocess.run, no ticker thread).
+        # That's what the 31 existing tests in
+        # test_lspatch_install_rollback rely on.
+        if progress_cb is None:
+            t0 = time.monotonic()
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True,
+                                      timeout=600, check=False, env=env)
+            except subprocess.TimeoutExpired:
+                return PatchResult(False, self.patched_dir,
+                                   elapsed_s=time.monotonic() - t0,
+                                   error="lspatch timed out (>10 min)")
+            elapsed = time.monotonic() - t0
+            if proc.returncode != 0:
+                tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-15:]
+                return PatchResult(False, self.patched_dir,
+                                   elapsed_s=elapsed,
+                                   error="lspatch exited non-zero",
+                                   log_tail="\n".join(tail))
+            outputs = sorted(self.patched_dir.glob("*-lspatched.apk"))
+            if not outputs:
+                tail = (proc.stdout or "").strip().splitlines()[-15:]
+                return PatchResult(False, self.patched_dir,
+                                   elapsed_s=elapsed,
+                                   error="lspatch produced no output APKs",
+                                   log_tail="\n".join(tail))
+            return PatchResult(
+                ok=True,
+                output_dir=self.patched_dir,
+                patched_apks=outputs,
+                elapsed_s=elapsed,
+                log_tail=(proc.stdout or "").strip().splitlines()[-3:][0]
+                if proc.stdout else "",
+            )
+
+        # Progress-instrumented path: Popen + reader threads + ticker.
+        # The reader threads drain stdout/stderr so the OS pipe buffer
+        # can't deadlock on a chatty patch (Java logs ~200 KB on 50-
+        # split TikTok). The ticker thread fires interpolated %
+        # updates every 0.5 s.
         t0 = time.monotonic()
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=600, check=False, env=env)
-        except subprocess.TimeoutExpired:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1, env=env,
+            )
+        except OSError as exc:
             return PatchResult(False, self.patched_dir,
                                elapsed_s=time.monotonic() - t0,
-                               error="lspatch timed out (>10 min)")
+                               error=f"ไม่สามารถเปิด LSPatch ได้: {exc}")
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        # Latest opportunistic filename mention — when the ticker
+        # next fires it surfaces this in the status line so the
+        # customer sees concrete progress (filenames flying past).
+        last_apk_hint: dict[str, str] = {"msg": "กำลัง patch APK ทุกไฟล์..."}
+
+        def _drain(stream, sink: list[str], scan_apk: bool) -> None:
+            """Drain a pipe into ``sink`` (bounded ring), optionally
+            extracting ``.apk`` filename hints for the ticker."""
+            try:
+                for line in stream:
+                    s = line.rstrip()
+                    sink.append(s)
+                    if len(sink) > 200:
+                        del sink[:100]
+                    if scan_apk and ".apk" in s.lower():
+                        # Last component looks like the filename for
+                        # most lspatch logging formats — short, easy
+                        # to read in the status line.
+                        snippet = s.split("/")[-1][:50]
+                        last_apk_hint["msg"] = f"Patch {snippet}..."
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_drain, args=(proc.stdout, stdout_lines, True),
+            name="lspatch-stdout", daemon=True,
+        ).start()
+        threading.Thread(
+            target=_drain, args=(proc.stderr, stderr_lines, True),
+            name="lspatch-stderr", daemon=True,
+        ).start()
+
+        # Ticker: every 0.5 s, emit interpolated progress with the
+        # latest apk-hint message. Maps 0.10..0.95 over expected_s.
+        ticker_stop = threading.Event()
+
+        def _ticker() -> None:
+            while not ticker_stop.wait(0.5):
+                elapsed_local = time.monotonic() - t0
+                frac = min(0.95, elapsed_local / max(1.0, expected_s))
+                pct = 0.10 + frac * 0.85  # 0.10..0.9525 — capped to 0.95
+                _fire_progress(
+                    progress_cb, min(0.95, pct), last_apk_hint["msg"],
+                )
+
+        ticker_thread = threading.Thread(
+            target=_ticker, name="lspatch-ticker", daemon=True,
+        )
+        ticker_thread.start()
+
+        try:
+            try:
+                proc.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    log.warning("lspatch refused to die after timeout kill")
+                return PatchResult(False, self.patched_dir,
+                                   elapsed_s=time.monotonic() - t0,
+                                   error="lspatch timed out (>10 min)")
+        finally:
+            ticker_stop.set()
+            ticker_thread.join(timeout=2)
+
         elapsed = time.monotonic() - t0
         if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-15:]
+            tail = (stderr_lines or stdout_lines)[-15:]
             return PatchResult(False, self.patched_dir,
                                elapsed_s=elapsed,
                                error="lspatch exited non-zero",
                                log_tail="\n".join(tail))
 
+        _fire_progress(progress_cb, 0.98, "ตรวจสอบไฟล์ผลลัพธ์...")
         outputs = sorted(self.patched_dir.glob("*-lspatched.apk"))
         if not outputs:
-            tail = (proc.stdout or "").strip().splitlines()[-15:]
+            tail = stdout_lines[-15:]
             return PatchResult(False, self.patched_dir,
                                elapsed_s=elapsed,
                                error="lspatch produced no output APKs",
                                log_tail="\n".join(tail))
 
+        _fire_progress(progress_cb, 1.0,
+                       f"Patch สำเร็จ ({len(outputs)} APK, {elapsed:.0f} วินาที)")
         return PatchResult(
             ok=True,
             output_dir=self.patched_dir,
             patched_apks=outputs,
             elapsed_s=elapsed,
-            log_tail=(proc.stdout or "").strip().splitlines()[-3:][0]
-            if proc.stdout else "",
+            log_tail=stdout_lines[-3:][0] if stdout_lines else "",
         )
 
     # ──────────────────────────────
@@ -514,6 +731,7 @@ class LSPatchPipeline:
         serial: str | None = None,
         uninstall_first: bool = True,
         original_apks: list[Path] | None = None,
+        progress_cb: ProgressCB = None,
     ) -> InstallResult:
         """Uninstall the original, then `adb install-multiple` the patched bundle.
 
@@ -533,6 +751,16 @@ class LSPatchPipeline:
         phone is back to its pre-Patch state, and the GUI can show a
         "rolled back, please retry" message instead of "TikTok is
         gone, sorry".
+
+        Progress callback contract
+        --------------------------
+        ``progress_cb`` (default None — pre-v1.8.14 behaviour) fires
+        across [0, 1] within this call. Update points:
+
+        * 0.05 → "ลบ TikTok เดิม..."
+        * 0.20 → "ติดตั้ง patched APKs ({N} ไฟล์)..."
+        * 0.85 → "ตรวจสอบ signature..."
+        * 1.00 → "ติดตั้งสำเร็จ"
         """
         adb = self.cfg.adb_path
         if not patched_apks:
@@ -543,6 +771,7 @@ class LSPatchPipeline:
         # Step 1: uninstall the original. If it isn't installed that's
         # fine — `adb uninstall` returns nonzero but we ignore.
         if uninstall_first:
+            _fire_progress(progress_cb, 0.05, "ลบ TikTok เดิม...")
             cmd = [adb]
             if serial:
                 cmd += ["-s", serial]
@@ -551,6 +780,10 @@ class LSPatchPipeline:
                            timeout=30, check=False)
 
         # Step 2: install-multiple the entire patched bundle.
+        _fire_progress(
+            progress_cb, 0.20,
+            f"ติดตั้ง patched APKs ({len(patched_apks)} ไฟล์)...",
+        )
         cmd = [adb]
         if serial:
             cmd += ["-s", serial]
@@ -565,6 +798,7 @@ class LSPatchPipeline:
                 serial=serial,
                 t0=t0,
                 error="install-multiple timed out",
+                progress_cb=progress_cb,
             )
         elapsed = time.monotonic() - t0
         if r.returncode != 0 or "Success" not in (r.stdout or ""):
@@ -575,6 +809,7 @@ class LSPatchPipeline:
                 serial=serial,
                 t0=t0,
                 error="\n".join(tail),
+                progress_cb=progress_cb,
             )
 
         # Step 3: read back the new signature so we can show "patched"
@@ -583,6 +818,7 @@ class LSPatchPipeline:
         # install-time fingerprint and the runtime probe — they MUST
         # extract the same hex string for the per-device baseline to
         # match on subsequent probes.
+        _fire_progress(progress_cb, 0.85, "ตรวจสอบ signature...")
         from . import hook_status as _hs
         sig = self._adb_shell(
             f"dumpsys package {package} | "
@@ -591,6 +827,7 @@ class LSPatchPipeline:
         )
         fp = _hs._extract_fingerprint(sig or "")
 
+        _fire_progress(progress_cb, 1.0, "ติดตั้งสำเร็จ")
         return InstallResult(ok=True, elapsed_s=elapsed, fingerprint=fp)
 
     def _rollback_install(
@@ -601,6 +838,7 @@ class LSPatchPipeline:
         serial: str | None,
         t0: float,
         error: str,
+        progress_cb: ProgressCB = None,
     ) -> InstallResult:
         """Try to re-install the original APKs after a failed patch install.
 
@@ -649,6 +887,10 @@ class LSPatchPipeline:
         log.warning(
             "patch install failed (%s); attempting rollback of %d APKs",
             error.splitlines()[0] if error else "unknown", len(existing),
+        )
+        _fire_progress(
+            progress_cb, 0.50,
+            f"กู้คืน TikTok เดิม ({len(existing)} APK)...",
         )
         try:
             r = subprocess.run(
