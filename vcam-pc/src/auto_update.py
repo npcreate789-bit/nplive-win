@@ -545,6 +545,10 @@ class UpdatePoller:
         self.url = url
         self.interval_s = max(60, int(interval_s))
         self._stop = threading.Event()
+        # ``_kick`` lets ``poll_now`` / ``kick`` wake the timer
+        # thread between regular ticks so a manual "Check now"
+        # click in the UI doesn't have to wait the full 6 h sleep.
+        self._kick = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_seen_version: Optional[str] = None
 
@@ -577,8 +581,418 @@ class UpdatePoller:
                         log.exception("on_update callback")
             except Exception:
                 log.exception("update poll iteration")
-            if self._stop.wait(timeout=self.interval_s):
-                return
+            # Wait for the regular interval OR a manual kick from
+            # ``poll_now``. Short poll quantum so the "Check now"
+            # button doesn't hide behind a 6 h sleep.
+            for _ in range(max(1, self.interval_s)):
+                if self._stop.wait(timeout=1.0):
+                    return
+                if self._kick.is_set():
+                    self._kick.clear()
+                    break
+
+    # ── v1.8.13: manual "Check now" + synchronous probe ──────────
+    #
+    # The original API was "background only — UI sees manifests via
+    # the on_update callback whenever the 6 h tick fires." Customers
+    # who knew a patch was being published wanted a button that
+    # said *check right now*, but waking the timer thread from
+    # another thread needed a kick channel. We added ``_kick`` above
+    # (consumed in the polling loop) plus two new public methods:
+    #
+    # * ``poll_now()`` — synchronous fetch (call from a worker
+    #   thread, blocks on network). Returns the manifest (or None)
+    #   AND fires ``on_update`` if it's newer than the last one we
+    #   surfaced — same contract as the background path so the
+    #   banner code only needs one code path.
+    # * ``kick()`` — async wake-up for the timer thread, useful if
+    #   you want the background loop to pick up your hint without
+    #   blocking the caller (e.g. after Settings → "Reset last seen
+    #   version" you want the next 6 h tick to come early).
+
+    def poll_now(self) -> Optional["UpdateManifest"]:
+        """Synchronous manifest fetch — call from a worker thread.
+
+        Performs the same fetch + verify + ``on_update`` trampoline
+        as the background tick but **right now**, blocking the
+        caller until the network round-trip completes. Returns the
+        manifest (None if no update / network failure).
+
+        Network call → MUST NOT be called from the Tk main thread,
+        or the UI will freeze for the duration of the HTTP fetch.
+
+        Idempotent with respect to ``_last_seen_version``: if the
+        manifest reports a version we've already surfaced to the
+        UI, we DON'T re-fire ``on_update``. That matches the
+        background loop's behaviour so a manual "Check now" click
+        and a 6 h auto-tick are indistinguishable to the banner.
+        """
+        try:
+            m = fetch_manifest(self.url)
+        except Exception:
+            log.exception("auto-update: poll_now fetch failed")
+            return None
+        if m and m.version != self._last_seen_version:
+            self._last_seen_version = m.version
+            try:
+                self.on_update(m)
+            except Exception:
+                log.exception("on_update callback (poll_now)")
+        return m
+
+    def kick(self) -> None:
+        """Wake the background poller so the next iteration runs
+        immediately instead of waiting the full ``interval_s``.
+
+        Safe to call from any thread. Idempotent — multiple kicks
+        before the loop consumes the event coalesce to one extra
+        poll, not N.
+        """
+        self._kick.set()
+
+
+# ── v1.8.13: persistent prefetch cache ──────────────────────────────
+#
+# The original ``download_patch`` writes its zip to
+# ``tempfile.gettempdir()`` which most OSes wipe across reboots
+# (macOS purges ``/var/folders/...`` aggressively, Windows
+# cleans ``%TEMP%`` on big-update reboots). That's fine for the
+# "click → download → apply → restart" path the customer kicked
+# off seconds earlier — but breaks the new flow where we want to
+# pre-download the patch the moment the banner appears, then
+# apply it later (next launch, on close, or when the customer
+# eventually clicks the button).
+#
+# We therefore stash prefetched patches under
+# ``<project>/cache/updates/`` which the customer's own backup
+# tooling already covers and which survives reboots. The cache
+# is small (one zip per pending version, typically <500 KB).
+#
+# Backward-compat: ``download_patch`` keeps using its temp-dir
+# staging unchanged. The new ``prefetch_patch`` lives alongside
+# it; the UI picks which one to call based on the flow it wants.
+
+_PREFETCH_CACHE_DIRNAME = "updates"
+
+
+def prefetch_cache_dir(*, project_root: Optional[Path] = None) -> Path:
+    """Where prefetched patches live. Persists across app restarts.
+
+    ``project_root`` override exists so tests can isolate the cache
+    (otherwise the unit test would pollute the developer's real
+    ``cache/updates/``). Production callers should leave it None;
+    we resolve to the same project root the rest of the app uses
+    via ``src.config.PROJECT_ROOT`` so all caches sit side-by-side.
+    """
+    if project_root is None:
+        # Lazy import: avoids a cycle if config.py ever wants to
+        # import auto_update (it doesn't today, but the cycle would
+        # be silent and only show up under specific test orderings).
+        from .config import PROJECT_ROOT
+        project_root = PROJECT_ROOT
+    p = Path(project_root) / "cache" / _PREFETCH_CACHE_DIRNAME
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _patch_filename(manifest: "UpdateManifest") -> str:
+    """Filename inside the prefetch cache for a given manifest.
+
+    Includes the sha256 prefix so a manifest that ships the same
+    version string twice with different bytes (e.g. a re-spin) gets
+    a fresh file instead of reusing a stale one. The version-first
+    layout still makes the cache trivially greppable by humans
+    debugging "what patches has this machine downloaded."
+    """
+    short_sha = manifest.sha256_hex[:12]
+    return f"npcreate-src-{manifest.version}-{short_sha}.zip"
+
+
+def cached_patch_path(
+    manifest: "UpdateManifest",
+    *,
+    cache_dir: Optional[Path] = None,
+) -> Path:
+    """Canonical disk path ``prefetch_patch`` would write to for
+    ``manifest``. Always returns the path — does NOT check whether
+    the file exists yet. Use ``find_cached_patch`` for that.
+    """
+    cd = cache_dir if cache_dir is not None else prefetch_cache_dir()
+    return cd / _patch_filename(manifest)
+
+
+def find_cached_patch(
+    manifest: "UpdateManifest",
+    *,
+    cache_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the cached zip path iff a complete + sha-matching
+    file already exists on disk for ``manifest``. Returns ``None``
+    if missing, mismatched, or unreadable.
+
+    Used by the UI to decide whether the "Install" button should
+    say "Install" (instant — cached) or "Download + install" (need
+    network). Also lets the install-on-close path apply without
+    spinning the network up again at shutdown.
+    """
+    p = cached_patch_path(manifest, cache_dir=cache_dir)
+    if not p.is_file():
+        return None
+    try:
+        # Stream-hash so a 50 MB cap doesn't briefly hold 50 MB of
+        # bytes in memory just to verify a cache hit.
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(64 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        log.warning("auto-update: cached patch unreadable, dropping cache")
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return None
+    if h.hexdigest().lower() != manifest.sha256_hex.lower():
+        log.info(
+            "auto-update: cached patch %s sha mismatch — re-downloading",
+            p.name,
+        )
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return None
+    return p
+
+
+def _http_get_resumable(
+    url: str,
+    dest: Path,
+    *,
+    timeout: float = 8.0,
+    max_bytes: int = MAX_PATCH_BYTES,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    cancel_event: "Optional[threading.Event]" = None,
+) -> int:
+    """Download ``url`` to ``dest``, supporting ``Range:`` resume.
+
+    Behaviour
+    ---------
+    * If ``dest.part`` already exists, sends ``Range: bytes=<size>-``
+      and appends. Server returning 206 → we keep what's on disk.
+      Server returning 200 instead (no range support, or partial
+      stale) → we wipe ``.part`` and start over from byte zero.
+    * Writes go to ``<dest>.part``; on successful completion we
+      rename ``.part`` → ``dest`` (atomic rename on the same fs).
+    * Size cap enforced both pre-flight (Content-Length / Content-Range)
+      AND mid-stream so a server lying about length can't OOM us.
+    * ``cancel_event`` checked between chunks; on trip we leave the
+      ``.part`` file on disk so the next resume continues where we
+      stopped.
+
+    Returns the total bytes now on disk (== size of ``dest`` after
+    rename). Raises ``UpdateError`` on every failure mode so callers
+    have one exception class to catch.
+    """
+    part = dest.with_suffix(dest.suffix + ".part")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = part.stat().st_size if part.is_file() else 0
+    headers = {
+        "User-Agent": f"NP-Create/{BRAND.version}",
+        "Accept": "application/octet-stream, application/json",
+    }
+    if existing > 0:
+        headers["Range"] = f"bytes={existing}-"
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        from . import _ssl as _ssl_helper
+        ctx = _ssl_helper.default_context()
+        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise UpdateError(f"fetch failed: {exc}") from exc
+
+    status = getattr(resp, "status", None) or resp.getcode()
+    # 206 = server honoured Range; 200 = server ignored it (start over).
+    if existing > 0 and status == 200:
+        log.info(
+            "auto-update: server ignored Range — restarting from byte 0",
+        )
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        existing = 0
+
+    total: int
+    cr = resp.headers.get("Content-Range")
+    cl = resp.headers.get("Content-Length")
+    if cr:
+        # Format: ``bytes 1024-9999/12345`` — pull the absolute total.
+        try:
+            total = int(cr.rsplit("/", 1)[-1])
+        except (ValueError, IndexError):
+            total = -1
+    elif cl:
+        try:
+            total = existing + int(cl)
+        except ValueError:
+            total = -1
+    else:
+        total = -1
+
+    if total > max_bytes:
+        raise UpdateError(f"file too large: {total} > {max_bytes}")
+
+    # Open append-mode so a 206 response continues the file; if we
+    # restarted from zero above, the unlink() above means we'll
+    # create it fresh.
+    mode = "ab" if existing > 0 and status == 206 else "wb"
+    if mode == "wb":
+        # When restarting, make sure we don't carry stale bytes.
+        existing = 0
+    got = existing
+    try:
+        with part.open(mode) as f:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise UpdateError("download cancelled by caller")
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if got > max_bytes:
+                    raise UpdateError(
+                        f"file exceeded cap mid-download: {got}"
+                    )
+                if progress_cb is not None:
+                    try:
+                        progress_cb(got, total)
+                    except Exception:
+                        # Buggy callback must never abort the download.
+                        log.exception("update progress callback")
+    except (OSError, ConnectionError) as exc:
+        # Don't unlink .part — next call can resume from where we
+        # stopped. Just surface the error.
+        raise UpdateError(f"download interrupted: {exc}") from exc
+
+    # Atomic rename so a half-written file never gets seen as
+    # complete. ``dest`` might already exist if a parallel caller
+    # finished first — unlikely for the prefetcher, but defensive.
+    try:
+        if dest.exists():
+            dest.unlink()
+        part.rename(dest)
+    except OSError as exc:
+        raise UpdateError(f"finalise rename failed: {exc}") from exc
+    return got
+
+
+def prefetch_patch(
+    manifest: UpdateManifest,
+    *,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    cache_dir: Optional[Path] = None,
+    cancel_event: "Optional[threading.Event]" = None,
+) -> Path:
+    """Download (with resume) + verify + cache the patch.
+
+    Difference from ``download_patch``
+    -----------------------------------
+    * Cache is **persistent** (``<project>/cache/updates/``) so the
+      pre-downloaded zip survives across app restarts.
+    * If the target file is already on disk and its sha matches,
+      returns immediately without touching the network — cache hit.
+    * Partial downloads (``.part`` sidecar) resume via HTTP ``Range``.
+    * ``cancel_event`` lets a UI dismiss the banner mid-prefetch
+      without orphaning the worker thread.
+
+    Returns the verified zip path. Raises ``UpdateError`` on every
+    failure (mirrors ``download_patch`` so existing callers can
+    swap in with a one-line change).
+    """
+    if manifest.kind != "source":
+        raise UpdateError(
+            f"cannot auto-apply kind={manifest.kind!r}; "
+            "open download_url in browser instead"
+        )
+
+    cached = find_cached_patch(manifest, cache_dir=cache_dir)
+    if cached is not None:
+        # Surface "we already have it" to the UI's progress bar so
+        # it doesn't sit at 0% before jumping to apply.
+        if progress_cb is not None:
+            try:
+                size = cached.stat().st_size
+                progress_cb(size, size)
+            except Exception:
+                log.exception("cache-hit progress callback")
+        return cached
+
+    dest = cached_patch_path(manifest, cache_dir=cache_dir)
+    _http_get_resumable(
+        manifest.download_url,
+        dest,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+    )
+
+    # Verify SHA AFTER finalise so a corrupted download doesn't
+    # masquerade as a cache hit on the next call. We stream-hash
+    # off disk rather than re-buffering bytes in memory.
+    h = hashlib.sha256()
+    with dest.open("rb") as f:
+        for chunk in iter(lambda: f.read(64 * 1024), b""):
+            h.update(chunk)
+    if h.hexdigest().lower() != manifest.sha256_hex.lower():
+        # Drop the bad file so a subsequent prefetch retries instead
+        # of finding a poisoned cache.
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise UpdateError(
+            f"sha256 mismatch after download: got {h.hexdigest()} "
+            f"expected {manifest.sha256_hex}"
+        )
+    return dest
+
+
+def prune_cached_patches(
+    *,
+    keep_version: Optional[str] = None,
+    cache_dir: Optional[Path] = None,
+) -> int:
+    """Delete stale cached patches.
+
+    Called by the UI when a new manifest replaces an old one (e.g.
+    admin pushed v1.8.14 while the user still had v1.8.13.zip
+    sitting in their cache). Without this, ``cache/updates/`` would
+    grow unboundedly across releases.
+
+    ``keep_version``: skip files whose name contains this version
+    string so the *current* prefetch isn't wiped if it's already
+    completed. Pass None to wipe everything.
+
+    Returns the number of files actually removed.
+    """
+    cd = cache_dir if cache_dir is not None else prefetch_cache_dir()
+    if not cd.is_dir():
+        return 0
+    removed = 0
+    for f in cd.iterdir():
+        if not f.is_file():
+            continue
+        if keep_version and keep_version in f.name:
+            continue
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            log.warning("auto-update: could not prune stale cache file %s", f)
+    return removed
 
 
 __all__ = [
@@ -591,4 +1005,10 @@ __all__ = [
     "apply_patch",
     "relaunch",
     "is_newer",
+    # v1.8.13 — Pack A additions
+    "prefetch_patch",
+    "find_cached_patch",
+    "cached_patch_path",
+    "prefetch_cache_dir",
+    "prune_cached_patches",
 ]

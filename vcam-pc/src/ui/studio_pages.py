@@ -1248,15 +1248,48 @@ class DashboardPage(ctk.CTkFrame):
         self._current_update = None  # last UpdateManifest passed in
         self._update_installing = False  # guard against double-click
 
+        # v1.8.13 — background prefetch state. The banner now starts
+        # downloading the patch ZIP the moment ``set_update`` is
+        # called (subject to ``UpdatePrefs.auto_prefetch``), so by
+        # the time the customer clicks "อัปเดตเลย" the bytes are
+        # already on disk and the install is instant. Falling back
+        # to a synchronous download on click is still supported —
+        # if the prefetch failed for any reason the click handler
+        # just re-runs ``prefetch_patch`` (which now has cache +
+        # resume) and proceeds as before.
+        self._prefetch_thread = None  # type: ignore[var-annotated]
+        self._prefetched_path = None  # type: ignore[var-annotated]
+        self._prefetch_cancel = None  # type: ignore[var-annotated]
+        self._prefetch_state = "idle"  # idle|fetching|ready|failed
+
     def set_update(self, manifest) -> None:
         """Show ``manifest`` (an ``auto_update.UpdateManifest``) in
         the banner. Pass ``None`` to hide it. Called by
         ``StudioApp`` from the Tk thread (the poller trampolines
-        through ``after``)."""
+        through ``after``).
+
+        v1.8.13: if a different manifest replaces an in-flight
+        prefetch we cancel the old one so two parallel downloads
+        can't compete for the network or write to different cache
+        files for the same banner state.
+        """
         if manifest is None:
             self.upd_card.grid_remove()
             self._current_update = None
+            self._cancel_prefetch_if_running()
             return
+
+        # New manifest arriving while an old prefetch is still in
+        # flight — cancel it. ``prune_cached_patches`` later cleans
+        # up any leftover ``.part`` file on the next launch.
+        if (
+            self._current_update is not None
+            and self._current_update.version != manifest.version
+        ):
+            self._cancel_prefetch_if_running()
+            self._prefetched_path = None
+            self._prefetch_state = "idle"
+
         self.upd_title.configure(
             text=f"🚀 อัปเดตใหม่ v{manifest.version} พร้อมใช้งาน",
         )
@@ -1275,6 +1308,165 @@ class DashboardPage(ctk.CTkFrame):
         self.upd_body.configure(text=notes)
         self._current_update = manifest
         self.upd_card.grid()
+
+        # Auto-prefetch — only for source patches (full installers
+        # can't be auto-applied so pre-downloading them just wastes
+        # bytes the customer might be paying for on cellular).
+        if manifest.kind == "source":
+            self._maybe_start_prefetch(manifest)
+
+    def _maybe_start_prefetch(self, manifest) -> None:
+        """Kick off background download of ``manifest`` if the
+        prefs allow + we don't already have it.
+
+        Called from ``set_update`` (Tk thread). The actual fetch
+        runs in a daemon worker so the UI doesn't freeze; we use
+        ``self.after(0, ...)`` to trampoline progress + completion
+        back into the Tk thread for safe widget updates.
+        """
+        try:
+            from .. import auto_update, update_prefs
+        except Exception:
+            log.exception("auto-update modules unavailable for prefetch")
+            return
+
+        try:
+            prefs = update_prefs.UpdatePrefs.load()
+        except Exception:
+            log.exception("update_prefs load failed; assuming defaults")
+            prefs = update_prefs.UpdatePrefs()
+        if not prefs.auto_prefetch:
+            return
+
+        # Already cached from a previous session — no need to fetch.
+        try:
+            cached = auto_update.find_cached_patch(manifest)
+        except Exception:
+            log.exception("find_cached_patch failed")
+            cached = None
+        if cached is not None:
+            self._prefetched_path = cached
+            self._prefetch_state = "ready"
+            self._mark_prefetch_ready()
+            return
+
+        # Spawn the prefetch worker. We use a per-banner-lifetime
+        # cancel event so dismissing the banner mid-fetch (or a new
+        # manifest replacing the current one) can bail cleanly.
+        import threading as _threading
+        self._prefetch_cancel = _threading.Event()
+        self._prefetch_state = "fetching"
+        self._prefetch_thread = _threading.Thread(
+            target=self._prefetch_worker,
+            args=(manifest, self._prefetch_cancel),
+            name="np-update-prefetch",
+            daemon=True,
+        )
+        self._prefetch_thread.start()
+
+    def _prefetch_worker(self, manifest, cancel_event) -> None:
+        """Worker thread: downloads + verifies the patch zip into
+        the persistent cache. On success, updates the banner button
+        to "⚡ พร้อมติดตั้ง" so the customer knows the click will
+        be instant.
+        """
+        from .. import auto_update
+
+        def _on_progress(got: int, total: int) -> None:
+            # We don't surface prefetch progress in the banner
+            # itself — the banner is for "click to install" and
+            # showing a progress bar before the click would mislead
+            # the customer into thinking they're already
+            # mid-install. We DO log so the support page can
+            # confirm prefetch is moving.
+            if total > 0 and got % (1024 * 256) == 0:  # ~every 256 KB
+                log.debug(
+                    "update prefetch: %d / %d KB",
+                    got // 1024, total // 1024,
+                )
+
+        try:
+            path = auto_update.prefetch_patch(
+                manifest,
+                progress_cb=_on_progress,
+                cancel_event=cancel_event,
+            )
+        except Exception as exc:
+            # The fallback on click is to re-run prefetch_patch
+            # which has resume — so a transient prefetch failure
+            # isn't user-visible here, we just log.
+            log.info("auto-update: prefetch did not complete (%s)", exc)
+            self.after(0, lambda: self._mark_prefetch_failed())
+            return
+
+        self.after(0, lambda p=path: self._mark_prefetch_ready(p))
+
+    def _mark_prefetch_ready(self, path=None) -> None:
+        """Tk-thread callback: prefetch finished, update button.
+
+        ``path`` is None when called from the "already cached"
+        branch in ``_maybe_start_prefetch``; otherwise it's the
+        verified zip path from the worker. We store either way so
+        the click handler can apply directly without re-downloading.
+        """
+        if path is not None:
+            self._prefetched_path = path
+        self._prefetch_state = "ready"
+        if self._update_installing:
+            # Install already started — don't stomp on the
+            # "กำลังดาวน์โหลด..." status text mid-flight.
+            return
+        if (
+            self._current_update is not None
+            and self._current_update.kind == "source"
+        ):
+            try:
+                self.upd_btn_install.configure(
+                    text="⚡  พร้อมติดตั้ง (instant)",
+                )
+            except Exception:
+                # Banner might have been destroyed between worker
+                # finishing and the trampoline firing.
+                log.debug("prefetch ready: button update skipped", exc_info=True)
+
+    def _mark_prefetch_failed(self) -> None:
+        """Tk-thread callback: prefetch failed quietly. The click
+        path still works (it calls prefetch_patch again which
+        retries with resume), so we just clear the state and leave
+        the button labelled "อัปเดตเลย".
+        """
+        self._prefetch_state = "failed"
+        self._prefetched_path = None
+
+    def _cancel_prefetch_if_running(self) -> None:
+        """Signal the prefetch worker to bail (banner dismissed or
+        replaced). Idempotent — safe to call from set_update on
+        every paint.
+        """
+        try:
+            if self._prefetch_cancel is not None:
+                self._prefetch_cancel.set()
+        except Exception:
+            pass
+        self._prefetch_thread = None
+        self._prefetch_cancel = None
+
+    def has_prefetched_patch(self) -> bool:
+        """Public probe for ``StudioApp._on_close``: is there a
+        verified zip on disk we can apply right now?
+        """
+        return (
+            self._prefetch_state == "ready"
+            and self._prefetched_path is not None
+            and self._current_update is not None
+            and self._current_update.kind == "source"
+        )
+
+    def current_update_manifest(self):
+        """Expose the latest manifest to ``StudioApp`` for the
+        install-on-close path. Returns None when the banner is
+        hidden."""
+        return self._current_update
 
     def _on_update_install(self) -> None:
         m = self._current_update
@@ -1330,12 +1522,27 @@ class DashboardPage(ctk.CTkFrame):
             self.after(0, lambda p=pct, m=msg: self._update_set_progress(p, m))
 
         try:
-            self.after(0, lambda: self._update_set_progress(
-                0.05, "กำลังดาวน์โหลดแพทช์...",
-            ))
-            zip_path = auto_update.download_patch(
-                manifest, progress_cb=_on_dl_progress,
-            )
+            # v1.8.13: prefer the prefetched (or partially-resumed)
+            # cache so the click feels instant when the background
+            # download completed. If the cache miss, ``prefetch_patch``
+            # downloads with HTTP Range resume from any leftover
+            # ``.part`` file, so a flaky network earlier in the
+            # session doesn't force the customer to start over.
+            cached = self._prefetched_path
+            if cached is None or not Path(cached).is_file():
+                self.after(0, lambda: self._update_set_progress(
+                    0.05, "กำลังดาวน์โหลดแพทช์...",
+                ))
+                zip_path = auto_update.prefetch_patch(
+                    manifest, progress_cb=_on_dl_progress,
+                )
+            else:
+                # Instant — bytes already verified on disk by the
+                # background prefetch (sha256 matched).
+                zip_path = cached
+                self.after(0, lambda: self._update_set_progress(
+                    0.85, "ใช้แพทช์ที่ดาวน์โหลดล่วงหน้า...",
+                ))
             self.after(0, lambda: self._update_set_progress(
                 0.9, "ติดตั้งแพทช์...",
             ))
@@ -6072,9 +6279,18 @@ class SettingsPage(ctk.CTkFrame):
         support_card.grid_columnconfigure(0, weight=1)
         self._build_support_card(support_card)
 
+        # Updates card (v1.8.13) — manual check, install-on-close,
+        # auto-prefetch toggle. Lives between Support and About so
+        # the customer sees it in the same scrolling-down pass they
+        # use to check version / contact info.
+        updates_card = _card(body)
+        updates_card.grid(row=5, column=0, sticky="ew", padx=40, pady=10)
+        updates_card.grid_columnconfigure(0, weight=1)
+        self._build_updates_card(updates_card)
+
         # About card
         about_card = _card(body)
-        about_card.grid(row=5, column=0, sticky="ew", padx=40, pady=10)
+        about_card.grid(row=6, column=0, sticky="ew", padx=40, pady=10)
         about_card.grid_columnconfigure(0, weight=1)
 
         _h2(about_card, "เกี่ยวกับ").grid(
@@ -6422,6 +6638,219 @@ class SettingsPage(ctk.CTkFrame):
         self.lbl_backup_status.grid(
             row=8, column=0, sticky="w", padx=20, pady=(0, 20),
         )
+
+    # ── updates card (v1.8.13) ──────────────────────────────────────
+    def _build_updates_card(self, parent: ctk.CTkFrame) -> None:
+        """Manual update check + auto-prefetch toggle + install-on-close.
+
+        The auto-update poller still fires every 6 h in the background
+        (see ``UpdatePoller`` in ``auto_update``), but Pack A gives
+        the customer three new levers in one place:
+
+        * **"ตรวจอัปเดตเลย"** — synchronous fetch from a worker thread
+          so the customer doesn't have to wait the full 6 h timer
+          when they know a patch is being published (e.g. admin
+          announced it on Line OA).
+        * **"ติดตั้งตอนปิดโปรแกรม"** — opt-in toggle that applies the
+          pre-downloaded patch when the customer hits ``×`` on the
+          window. Defaults off because the behaviour changes
+          shutdown timing (extra ~2 s for ``apply_patch``).
+        * **"ดาวน์โหลดล่วงหน้า"** — default on; lets the banner
+          pre-fetch the patch in the background so the eventual
+          click feels instant.
+
+        Each toggle persists via ``UpdatePrefs`` so the next launch
+        remembers what the customer picked.
+        """
+        from .. import update_prefs as _prefs_mod
+        try:
+            prefs = _prefs_mod.UpdatePrefs.load()
+        except Exception:
+            log.exception("update_prefs load failed in settings card")
+            prefs = _prefs_mod.UpdatePrefs()
+        self._upd_prefs = prefs  # cache so the togges have something to mutate
+
+        _h2(parent, "🔄  อัปเดตโปรแกรม").grid(
+            row=0, column=0, sticky="w", padx=20, pady=(20, 4)
+        )
+
+        # Current version + last-check line. Mirrors what the
+        # About card shows but presents it in the "maintenance"
+        # context so the customer doesn't have to hunt for it.
+        cur = ctk.CTkFrame(parent, fg_color="transparent")
+        cur.grid(row=1, column=0, sticky="w", padx=20, pady=(0, 8))
+        ctk.CTkLabel(
+            cur,
+            text=f"เวอร์ชันปัจจุบัน: {BRAND.version}",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+        ).pack(side="left")
+
+        # Last-check timestamp, populated from ``UpdatePrefs``.
+        self.lbl_upd_last_check = ctk.CTkLabel(
+            parent,
+            text=self._format_last_check(prefs.last_check_ts),
+            text_color=THEME.fg_muted,
+            font=ctk.CTkFont(size=11),
+        )
+        self.lbl_upd_last_check.grid(
+            row=2, column=0, sticky="w", padx=20, pady=(0, 12),
+        )
+
+        # ── "ตรวจอัปเดตเลย" button + status line
+        btn_row = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_row.grid(row=3, column=0, sticky="w", padx=20, pady=(0, 8))
+
+        self.btn_check_now = _primary_button(
+            btn_row, "🔍  ตรวจอัปเดตเลย",
+            command=self._on_check_updates_now,
+            width=200,
+        )
+        self.btn_check_now.pack(side="left", padx=(0, 8))
+
+        # Status: "กำลังตรวจสอบ..." / "ไม่มีอัปเดตใหม่" / "เจอ v1.8.13"
+        self.lbl_upd_status = _muted(parent, "")
+        self.lbl_upd_status.grid(
+            row=4, column=0, sticky="w", padx=20, pady=(0, 12),
+        )
+
+        # Divider before the toggles so the eye groups them as a
+        # separate "preferences" cluster.
+        ctk.CTkFrame(
+            parent, fg_color=THEME.bg_input, height=1,
+        ).grid(row=5, column=0, sticky="ew", padx=20, pady=(4, 12))
+
+        # ── auto-prefetch toggle
+        self._upd_var_prefetch = ctk.BooleanVar(value=prefs.auto_prefetch)
+        ctk.CTkCheckBox(
+            parent,
+            text="ดาวน์โหลดอัปเดตล่วงหน้า (กดติดตั้งแล้วเร็วทันที)",
+            variable=self._upd_var_prefetch,
+            command=self._on_toggle_auto_prefetch,
+            text_color=THEME.fg_secondary,
+            fg_color=THEME.primary,
+            hover_color=THEME.primary_hover,
+            border_color=THEME.border,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=6, column=0, sticky="w", padx=20, pady=(0, 6))
+
+        # ── install-on-close toggle
+        self._upd_var_on_close = ctk.BooleanVar(value=prefs.install_on_close)
+        ctk.CTkCheckBox(
+            parent,
+            text="ติดตั้งตอนปิดโปรแกรม (ไม่ขัดงานระหว่างใช้งาน)",
+            variable=self._upd_var_on_close,
+            command=self._on_toggle_install_on_close,
+            text_color=THEME.fg_secondary,
+            fg_color=THEME.primary,
+            hover_color=THEME.primary_hover,
+            border_color=THEME.border,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=7, column=0, sticky="w", padx=20, pady=(0, 4))
+
+        _muted(
+            parent,
+            "เมื่อกดปุ่ม × ปิดหน้าต่าง โปรแกรมจะติดตั้งอัปเดตที่ดาวน์โหลด\n"
+            "ไว้แล้วก่อน — รอบหน้าเปิดมาเป็นเวอร์ชันใหม่อัตโนมัติ",
+        ).grid(row=8, column=0, sticky="w", padx=20, pady=(0, 20))
+
+    @staticmethod
+    def _format_last_check(ts: float) -> str:
+        """Render the prefs timestamp into Thai-friendly relative
+        copy. We avoid ``relativedelta`` to keep dependencies stdlib
+        only — the resolution we surface is "minutes / hours / days
+        / never" which is enough signal for the support case "is
+        the poller running on this machine."""
+        if not ts:
+            return "ยังไม่เคยตรวจ"
+        delta = max(0, int(time.time() - ts))
+        if delta < 60:
+            return f"ตรวจล่าสุด: {delta} วินาทีที่แล้ว"
+        if delta < 3600:
+            return f"ตรวจล่าสุด: {delta // 60} นาทีที่แล้ว"
+        if delta < 86400:
+            return f"ตรวจล่าสุด: {delta // 3600} ชั่วโมงที่แล้ว"
+        return f"ตรวจล่าสุด: {delta // 86400} วันที่แล้ว"
+
+    def _on_check_updates_now(self) -> None:
+        """Manual probe: kick the poller AND fire a one-shot
+        synchronous fetch from a worker thread (so the UI doesn't
+        freeze on the network call). The poller's ``poll_now``
+        deduplicates against the last-seen version, so back-to-back
+        clicks won't spam the banner with re-shows of the same
+        patch — that's the contract pinned by
+        ``test_auto_update_prefetch.test_poll_now_idempotent_for_same_version``.
+        """
+        self.btn_check_now.configure(
+            state="disabled", text="กำลังตรวจสอบ...",
+        )
+        self.lbl_upd_status.configure(
+            text="", text_color=THEME.fg_muted,
+        )
+        threading.Thread(
+            target=self._check_updates_worker,
+            name="np-settings-check-update",
+            daemon=True,
+        ).start()
+
+    def _check_updates_worker(self) -> None:
+        from .. import auto_update
+        manifest = None
+        err = None
+        try:
+            manifest = self.app.update_poller.poll_now()
+        except Exception as exc:
+            log.exception("manual update check failed")
+            err = str(exc) or exc.__class__.__name__
+
+        # Stamp last-check regardless of outcome so the customer
+        # sees "ตรวจล่าสุด: ตอนนี้" even when there's no patch.
+        try:
+            self._upd_prefs.mark_checked()
+        except Exception:
+            log.exception("mark_checked failed")
+
+        # Trampoline back to the Tk thread for widget updates.
+        self.after(0, lambda m=manifest, e=err:
+                   self._check_updates_done(m, e))
+
+    def _check_updates_done(self, manifest, err: "str | None") -> None:
+        self.btn_check_now.configure(
+            state="normal", text="🔍  ตรวจอัปเดตเลย",
+        )
+        try:
+            self.lbl_upd_last_check.configure(
+                text=self._format_last_check(self._upd_prefs.last_check_ts),
+            )
+        except Exception:
+            pass
+        if err:
+            self.lbl_upd_status.configure(
+                text=f"❌ ตรวจไม่ได้: {err}",
+                text_color=THEME.danger,
+            )
+            return
+        if manifest is None:
+            self.lbl_upd_status.configure(
+                text=f"✓ ใช้เวอร์ชันล่าสุด ({BRAND.version}) อยู่แล้ว",
+                text_color=THEME.success,
+            )
+            return
+        # Found a newer version — ``poll_now`` already trampolined
+        # through ``on_update`` which posts the banner on the
+        # Dashboard. We just confirm here.
+        self.lbl_upd_status.configure(
+            text=f"🚀 พบอัปเดตใหม่ v{manifest.version} — เปิดหน้า Dashboard เพื่อกดติดตั้ง",
+            text_color=THEME.primary,
+        )
+
+    def _on_toggle_auto_prefetch(self) -> None:
+        self._upd_prefs.auto_prefetch = bool(self._upd_var_prefetch.get())
+        self._upd_prefs.save()
+
+    def _on_toggle_install_on_close(self) -> None:
+        self._upd_prefs.install_on_close = bool(self._upd_var_on_close.get())
+        self._upd_prefs.save()
 
     def _on_export_log(self) -> None:
         from .. import log_setup

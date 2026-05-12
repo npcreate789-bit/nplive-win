@@ -1249,4 +1249,67 @@ class StudioApp(ctk.CTk):
         except Exception:
             log.exception("scrcpy mirror cleanup on shutdown failed")
         self.save_devices()
+        # v1.8.13: if the customer enabled "ติดตั้งตอนปิดโปรแกรม"
+        # AND the auto-update prefetcher already has the zip on
+        # disk, apply it now so the next launch boots into the new
+        # version. Best-effort — any failure (no cache, IO error,
+        # bad sha) just logs and falls through to ``destroy``.
+        # ``apply_patch``'s atomic src ↔ src.bak swap guarantees the
+        # install is bootable either way.
+        try:
+            self._apply_update_on_close_if_ready()
+        except Exception:
+            log.exception("install-on-close hook failed")
         self.destroy()
+
+    def _apply_update_on_close_if_ready(self) -> None:
+        """Apply a prefetched patch on close when the customer
+        opted in via Settings → "ติดตั้งตอนปิดโปรแกรม". Returns
+        silently if the toggle is off, no manifest is in hand, no
+        cached zip is on disk, or the cached zip is the wrong sha
+        (``find_cached_patch`` handles the sha check + cleanup).
+        """
+        from .. import auto_update, update_prefs
+
+        try:
+            prefs = update_prefs.UpdatePrefs.load()
+        except Exception:
+            log.exception("install-on-close: prefs load failed")
+            return
+        if not prefs.install_on_close:
+            return
+
+        manifest = self._latest_update
+        if manifest is None:
+            return
+        if getattr(manifest, "kind", None) != "source":
+            # Full installer can't be applied in-place; nothing to
+            # do here. The customer's existing browser-download
+            # flow on the banner is the right path.
+            return
+
+        try:
+            cached = auto_update.find_cached_patch(manifest)
+        except Exception:
+            log.exception("install-on-close: find_cached_patch failed")
+            return
+        if cached is None:
+            log.info(
+                "install-on-close: no cached patch for v%s — skipping",
+                manifest.version,
+            )
+            return
+
+        log.info(
+            "install-on-close: applying prefetched patch v%s",
+            manifest.version,
+        )
+        try:
+            auto_update.apply_patch(cached)
+        except Exception:
+            log.exception("install-on-close: apply_patch failed")
+            return
+        log.info(
+            "install-on-close: applied — next launch will run v%s",
+            manifest.version,
+        )
