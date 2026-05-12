@@ -1,0 +1,209 @@
+#!/bin/bash
+# NP Create — postinstall script for the macOS .pkg (v4, per-user).
+#
+# pkgbuild lays the payload at /Library/NP-Create-Stage/ (a system
+# staging area, root-writable). This script does the user-facing
+# work:
+#
+#   1. Identify the logged-in console user + their HOME.
+#   2. Move staged files into $HOME/Applications/NP Create/.
+#   3. Chown to that user so future Python writes (logs, cache,
+#      devices.json) don't need chmod 0777 hacks.
+#   4. Symlink /Applications/NP-Create.app → user-home .app for
+#      Launchpad / Spotlight visibility.
+#   5. Auto-launch the .app in the user's GUI session via launchctl.
+#   6. Clean up the now-empty /Library/NP-Create-Stage/.
+#
+# Why per-user instead of /Applications/NP Create/
+# ------------------------------------------------
+# pkgbuild installs into /Applications/ as root:wheel 0755. Every
+# write the Python code makes (LOG_DIR.mkdir, ``.cache/lspatch``,
+# ``customer_devices.json``, ``logs/`` rotation) trips
+# PermissionError because the regular user account doesn't own
+# the directory. chmod -R 0777 was a workaround but leaves the
+# install in a globally-writable state that other users on the
+# Mac can stomp on. Per-user install with proper ownership is the
+# canonical Apple-recommended path for non-shared apps.
+
+set -eu
+
+# Apple's pkg installer arg convention (re-confirmed from Apple's
+# Distribution Installer Reference):
+#   $1 = full path to the pkg currently being processed
+#   $2 = full path to the installation destination (== --install-location)
+#   $3 = installation volume / mountpoint
+#   $4 = root directory of the destination system
+PKG_PATH="$1"
+STAGE_DIR="${2%/}"      # /Library/NP-Create-Stage
+INSTALL_VOL="$3"
+SYS_ROOT="$4"
+LOG="/tmp/NP-Create-postinstall.log"
+
+echo "$(date) postinstall start STAGE_DIR=$STAGE_DIR INSTALL_VOL=$INSTALL_VOL" >> "$LOG"
+
+# ── Step 1: identify the logged-in console user ───────────────────
+# ``stat -f %Su /dev/console`` is the standard recipe for "who's at
+# the Mac right now" from a root-context script. Falls through
+# gracefully when no GUI user is present (CLI installer / SSH).
+LOGGED_IN_USER=$(stat -f "%Su" /dev/console 2>>"$LOG" || echo "")
+LOGGED_IN_UID=$(id -u "$LOGGED_IN_USER" 2>>"$LOG" || echo "")
+LOGGED_IN_HOME=$(dscl . -read "/Users/$LOGGED_IN_USER" NFSHomeDirectory 2>>"$LOG" \
+    | awk '{print $2}' || echo "")
+
+if [ -z "$LOGGED_IN_USER" ] || [ "$LOGGED_IN_USER" = "root" ] || \
+   [ -z "$LOGGED_IN_HOME" ] || [ ! -d "$LOGGED_IN_HOME" ]; then
+    echo "$(date) [FATAL] cannot resolve logged-in user — bailing" >> "$LOG"
+    # Don't exit 1 — Installer.app would mark the install as
+    # failed even though pkgbuild already laid the files. Fall
+    # through to symlink-and-skip-launch path.
+    LOGGED_IN_USER=""
+fi
+
+echo "$(date) user=$LOGGED_IN_USER uid=$LOGGED_IN_UID home=$LOGGED_IN_HOME" >> "$LOG"
+
+# ── Step 2: move staged files into the user's home ────────────────
+if [ -n "$LOGGED_IN_USER" ] && [ -d "$STAGE_DIR" ]; then
+    USER_INSTALL_DIR="$LOGGED_IN_HOME/Applications/NP Create"
+    mkdir -p "$LOGGED_IN_HOME/Applications"
+
+    # If a previous install exists at the same path, wipe it so
+    # we don't end up with a half-merged state mixing old + new
+    # bundle bytes.
+    if [ -d "$USER_INSTALL_DIR" ]; then
+        echo "$(date) removing existing $USER_INSTALL_DIR" >> "$LOG"
+        rm -rf "$USER_INSTALL_DIR" 2>>"$LOG" || true
+    fi
+
+    # Move (not copy) so we don't end up using 2× disk space mid-
+    # install. ``mv`` on a same-volume directory is a rename and
+    # finishes instantly regardless of payload size.
+    mv "$STAGE_DIR" "$USER_INSTALL_DIR" 2>>"$LOG" || {
+        echo "$(date) mv failed; falling back to rsync" >> "$LOG"
+        mkdir -p "$USER_INSTALL_DIR"
+        rsync -a "$STAGE_DIR/" "$USER_INSTALL_DIR/" 2>>"$LOG" || true
+        rm -rf "$STAGE_DIR" 2>>"$LOG" || true
+    }
+
+    # Chown the whole tree to the customer's user account. With
+    # proper ownership every Python write inside the .app
+    # (Contents/MacOS/logs/, Contents/.cache/lspatch/, ...) just
+    # works without needing 0777 — the customer IS the owner.
+    chown -R "$LOGGED_IN_UID:staff" "$USER_INSTALL_DIR" 2>>"$LOG" || true
+    echo "$(date) installed to $USER_INSTALL_DIR + chowned to $LOGGED_IN_USER" >> "$LOG"
+
+    APP_DIR="$USER_INSTALL_DIR"
+else
+    # No logged-in user — leave the staging where pkgbuild put it
+    # so a manual ``installer -pkg ...`` from CLI still has the
+    # files somewhere predictable. (Edge case: enterprise MDM.)
+    APP_DIR="$STAGE_DIR"
+fi
+
+# ── Step 3: belt-and-braces fixes inside the .app ────────────────
+xattr -dr com.apple.quarantine "$APP_DIR" 2>>"$LOG" || true
+
+APP_BIN="$APP_DIR/NP-Create.app/Contents/MacOS/NP-Create"
+if [ -f "$APP_BIN" ]; then
+    chmod +x "$APP_BIN" 2>>"$LOG" || true
+fi
+
+# Pre-create the runtime dirs the Python code writes to so the
+# first launch doesn't have to mkdir them at run time. With user-
+# owned install dir these are just convenience; the chmod is
+# kept for older macOS where chown alone occasionally surfaces
+# perm-bit weirdness.
+APP_CONTENTS="$APP_DIR/NP-Create.app/Contents"
+if [ -d "$APP_CONTENTS" ]; then
+    APP_MACOS="$APP_CONTENTS/MacOS"
+    for sub in logs cache videos; do
+        mkdir -p "$APP_MACOS/$sub" 2>>"$LOG" || true
+    done
+    mkdir -p "$APP_CONTENTS/.cache/lspatch" 2>>"$LOG" || true
+    if [ -n "$LOGGED_IN_UID" ]; then
+        chown -R "$LOGGED_IN_UID:staff" "$APP_CONTENTS" 2>>"$LOG" || true
+    fi
+fi
+
+# ── Step 4: shortcuts (Desktop + /Applications/) ──────────────────
+# Two symlinks so the customer's first-launch experience is "just
+# click the icon I see on my desktop / Launchpad" no matter where
+# they look:
+#   • $HOME/Desktop/NP-Create.app — first-launch convenience for
+#     a customer who just finished install and is staring at their
+#     desktop. This is the headline location v1.8.14 v4 added.
+#   • /Applications/NP-Create.app — Launchpad / Spotlight pickup.
+#
+# Launch Services resolves the symlink target before exec, so
+# ``sys.executable.parent`` inside the running .app still points at
+# the real Contents/MacOS in user home — platform_tools' 7-level
+# walk then finds ``.tools/`` next to the real .app. Both shortcuts
+# launch the same physical .app.
+APP_BUNDLE="$APP_DIR/NP-Create.app"
+
+_make_shortcut() {
+    local target_path="$1"
+    [ -d "$APP_BUNDLE" ] || return 0
+    if [ -L "$target_path" ]; then
+        rm -f "$target_path" 2>>"$LOG" || true
+    elif [ -d "$target_path" ]; then
+        echo "$(date) $target_path exists as a real dir — skipping shortcut" >> "$LOG"
+        return 0
+    fi
+    ln -s "$APP_BUNDLE" "$target_path" 2>>"$LOG" && \
+        echo "$(date) shortcut $target_path → $APP_BUNDLE" >> "$LOG"
+}
+
+# Desktop shortcut — needs to be owned by the logged-in user so
+# Finder doesn't fight with it. Create via ``sudo -u`` so the
+# symlink is created in the user's namespace.
+if [ -n "$LOGGED_IN_USER" ] && [ -n "$LOGGED_IN_HOME" ] && [ -d "$LOGGED_IN_HOME/Desktop" ]; then
+    DESKTOP_SHORTCUT="$LOGGED_IN_HOME/Desktop/NP-Create.app"
+    _make_shortcut "$DESKTOP_SHORTCUT"
+    # Make sure the symlink itself is owned by the customer (not
+    # root) so they can ``rm`` it later without sudo.
+    chown -h "$LOGGED_IN_UID:staff" "$DESKTOP_SHORTCUT" 2>>"$LOG" || true
+fi
+
+# Applications shortcut for Launchpad / Spotlight.
+APPS_SHORTCUT="${INSTALL_VOL%/}/Applications/NP-Create.app"
+_make_shortcut "$APPS_SHORTCUT"
+
+# Poke Launch Services so Launchpad picks up the new app without
+# requiring a logout/login.
+LSREG="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+if [ -x "$LSREG" ] && [ -d "$APP_BUNDLE" ]; then
+    "$LSREG" -f "$APP_BUNDLE" 2>>"$LOG" || true
+fi
+
+# ── Step 5: deferred auto-launch ──────────────────────────────────
+# Pre-v1.8.14 v4 the launch fired immediately inside postinstall,
+# which raced the Installer.app Conclusion screen — the .app's
+# Tk window opened BEHIND the still-visible "Installation
+# Successful" screen and the customer thought it didn't work. Fork
+# the launch into a background ``sleep`` so it fires AFTER the
+# customer has clicked Close on the Installer.app conclusion. 3 s
+# is generous: typical click-through time is 1-2 s, and the .app
+# itself takes ~2 s to first-paint, so the order ends up
+# (1) customer closes Installer.app, (2) NP-Create.app pops to
+# front.
+if [ -n "$LOGGED_IN_UID" ] && [ "$LOGGED_IN_USER" != "root" ] && \
+   [ -d "$APP_BUNDLE" ]; then
+    echo "$(date) deferred-launch scheduled (sleep 3) for uid=$LOGGED_IN_UID" >> "$LOG"
+    (
+        sleep 3
+        /bin/launchctl asuser "$LOGGED_IN_UID" \
+            /usr/bin/open "$APP_BUNDLE" 2>>"$LOG" || \
+            echo "$(date) deferred-launch failed" >> "$LOG"
+    ) &
+    disown 2>/dev/null || true
+fi
+
+# ── Step 6: cleanup the now-empty staging dir ────────────────────
+# (The mv at step 2 already drained it; this is a belt-and-braces
+# rmdir for the edge case where the dir survived a partial move.)
+if [ -d "$STAGE_DIR" ] && [ "$STAGE_DIR" != "$APP_DIR" ]; then
+    rmdir "$STAGE_DIR" 2>>"$LOG" || rm -rf "$STAGE_DIR" 2>>"$LOG" || true
+fi
+
+echo "$(date) postinstall done" >> "$LOG"
+exit 0

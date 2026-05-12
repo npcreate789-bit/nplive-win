@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NP Create — macOS installer UI definition (v1.8.14, v2).
+
+  Read by productbuild + Installer.app. Controls the customer-facing
+  installer experience: welcome screen, license, background image,
+  and the single embedded component that runs.
+
+  Single component install:
+    com.npcreate.studio  →  /Applications/NP Create/
+
+  Layout once installed:
+    NP-Create.app/    PyInstaller bundle (Python embedded)
+    .tools/macos/     adb, JDK 21, lspatch, ffmpeg, scrcpy, mediamtx
+    apk/              vcam-app-release.apk (LSPatch module)
+    MANUAL_TH.md      customer manual
+
+  No external Python install — the .app is self-contained.
+
+  String placeholders {NPC_*} are replaced by build_macos_pkg.sh
+  before productbuild reads the file.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>{NPC_TITLE}</title>
+    <organization>com.npcreate.studio</organization>
+    <domains enable_localSystem="true"/>
+
+    <!-- Visual customisation: dark-red branded background. The same
+         PNG renders in both light + dark Aqua modes. -->
+    <background file="background.png"
+                alignment="bottomleft"
+                scaling="proportional"
+                mime-type="image/png"/>
+    <background-darkAqua file="background.png"
+                          alignment="bottomleft"
+                          scaling="proportional"
+                          mime-type="image/png"/>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="license.txt" mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <!-- Minimum macOS = Big Sur (11.0). Covers Apple Silicon and
+         every Intel Mac still receiving Apple security updates. -->
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="11.0"/>
+        </allowed-os-versions>
+    </volume-check>
+
+    <!-- No checkbox UI; the single component is required. -->
+    <options customize="never" allow-external-scripts="no" rootVolumeOnly="false" require-scripts="false"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="npcreate"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default" title="{NPC_TITLE}"/>
+
+    <choice id="npcreate"
+            visible="false"
+            title="NP Create"
+            description="โปรแกรม NP Create และเครื่องมือที่เกี่ยวข้อง">
+        <pkg-ref id="com.npcreate.studio"/>
+    </choice>
+
+    <!-- NP Create app component. Built by pkgbuild against the
+         staged tree; {NPC_APP_PKG} is the local filename
+         build_macos_pkg.sh produces. -->
+    <pkg-ref id="com.npcreate.studio"
+             version="{NPC_VERSION}"
+             onConclusion="none"
+             auth="Root">{NPC_APP_PKG}</pkg-ref>
+</installer-gui-script>
