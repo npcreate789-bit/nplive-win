@@ -80,19 +80,20 @@ class StreamConfig:
     encode_width: int = 1920
     encode_height: int = 1080
 
-    # Mirror the encoded frame horizontally before the rotation
-    # chain. Defaults to True because TikTok's Live ingest pulls our
-    # MP4 through the **front-camera** Camera2 path on most Android
-    # builds, and the Android system applies an implicit horizontal
-    # mirror to front-cam frames (selfie convention) — viewers of
-    # the live see text/logos as a mirror image otherwise. Pre-
-    # flipping here cancels that mirror, so the broadcast looks
-    # identical to the source MP4.
-    #
-    # If a particular phone uses the *rear* camera instead (no
-    # implicit mirror), the customer can toggle this off in
-    # Settings → คุณภาพวิดีโอ → "ภาพสะท้อน".
-    mirror_horizontal: bool = True
+    # Horizontal mirror before ``transpose=1`` (legacy **front**
+    # camera ingest only). The LSPatch hook injects on the **rear**
+    # lens only (v1.8.8+), so defaults use ``hook_encode_rear_facing``
+    # below and leave this off unless you set
+    # ``hook_encode_rear_facing`` to false and need the old selfie
+    # cancellation path.
+    mirror_horizontal: bool = False
+
+    # When true (default), hook-mode FFmpeg targets TikTok's **rear**
+    # camera buffer (adds ``vflip`` after ``transpose=1``, skips
+    # ``hflip``) so customers only switch to the rear camera on the
+    # phone — no rotation knobs required. Set false in ``config.json``
+    # for the legacy front-camera filter chain.
+    hook_encode_rear_facing: bool = True
     video_bitrate: str = "2000k"
     video_maxrate: str = "2500k"
     video_bufsize: str = "4000k"
