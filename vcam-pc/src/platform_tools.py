@@ -133,6 +133,22 @@ def _tools_root_base() -> Path:
       ffmpeg / lspatch / vcam_apk, leaving the dashboard stuck
       with every device showing offline forever.
 
+    * **macOS dev build — .app sitting inside the source tree**
+      (v1.8.13+). Admin runs ``python tools/build_pyinstaller.py``
+      to smoke-test the bundle before shipping; the produced
+      ``vcam-pc/dist/pyinstaller/NP-Create.app/`` lives one
+      directory deeper than the production customer-ZIP layout
+      (``dist/pyinstaller/`` vs ``app/``) AND one further inside
+      ``vcam-pc/`` rather than at the bundle root. PROJECT_ROOT =
+      ``vcam-pc/dist/pyinstaller/NP-Create.app/Contents/MacOS/``
+      — i.e. SIX directory levels below the workspace root that
+      hosts ``.tools/``. The 5-level walk shipped in v1.8.4
+      stopped one level short of ``vcam-pc/`` (the actual
+      workspace root with ``.tools/`` is its parent), so the
+      dev-build dashboard reproduced the v1.8.3 "every device
+      offline" symptom whenever admin tested the .app locally.
+      v1.8.13 extends the bound to 7 levels to cover this case.
+
     Defensive walk
     --------------
     Rather than hard-code one rule per mode and pray we covered
@@ -142,10 +158,11 @@ def _tools_root_base() -> Path:
     single code path and silently absorbs any future installer
     layout we haven't thought of yet.
 
-    The walk is bounded (5 levels) — deep enough to escape the
-    nested ``app/NP-Create.app/Contents/MacOS/`` case but shallow
-    enough that a missing ``.tools/`` doesn't wander into the
-    user's home directory and pick up a stale toolchain there.
+    The walk is bounded (7 levels) — deep enough to escape the
+    dev-build ``vcam-pc/dist/pyinstaller/.app/Contents/MacOS/``
+    case (6 hops) but shallow enough that a missing ``.tools/``
+    doesn't wander into the user's home directory and pick up
+    a stale toolchain there.
     """
     if getattr(sys, "frozen", False):
         # Frozen: start at the .exe / .app dir and walk up.
@@ -158,15 +175,15 @@ def _tools_root_base() -> Path:
         # vcam-pc/, ``.tools/`` is one level up.
         start = PROJECT_ROOT.parent
 
-    # Walk up to 5 levels — the deepest case in production is
-    # ``Contents/MacOS/`` → ``Contents/`` → ``NP-Create.app/`` →
-    # ``app/`` → ``<bundle>/`` (.tools/ here) which is exactly 4
-    # hops, with one more in reserve for any future nesting we
-    # don't anticipate yet. Any deeper than that and we risk
-    # picking up a stale ``.tools/`` from the user's home
-    # directory or repo workspace.
+    # Walk up to 7 levels — deepest case is the dev .app sitting
+    # at ``vcam-pc/dist/pyinstaller/NP-Create.app/Contents/MacOS/``,
+    # which is 6 directories below the workspace root (MacOS →
+    # Contents → .app → pyinstaller → dist → vcam-pc → root). One
+    # level in reserve for any future nesting. Any deeper than
+    # that and we risk picking up a stale ``.tools/`` from the
+    # user's home directory.
     cand = start
-    for _ in range(5):
+    for _ in range(7):
         if (cand / ".tools").is_dir():
             return cand
         if cand.parent == cand:  # filesystem root

@@ -787,18 +787,58 @@ class StudioApp(ctk.CTk):
         except Exception:
             adb_path = None  # type: ignore[assignment]
 
+        # v1.8.13: the original copy hard-coded "adb.exe" and
+        # "Visual C++ Redistributable" / "Windows Defender" which
+        # are nonsense on macOS — a customer on Mac would read
+        # advice that doesn't apply to their OS. OS-detect once
+        # and pick platform-appropriate wording for both the
+        # filename and the suspected-cause sentence.
+        import sys as _sys
+        is_windows = _sys.platform.startswith("win")
+        is_macos = _sys.platform == "darwin"
+        adb_name = "adb.exe" if is_windows else "adb"
+        if is_windows:
+            cause_hint = (
+                f"พบ {adb_name} แต่รันไม่ได้ (อาจถูก antivirus กักหรือ\n"
+                "ขาด Visual C++ Redistributable)"
+            )
+            help_steps = (
+                "1. รีสตาร์ทเครื่อง แล้วเปิด NP Create อีกครั้ง\n"
+                f"2. ตรวจสอบว่า Windows Defender ไม่กัก {adb_name} ไว้\n"
+                "3. ส่งไฟล์ diagnostic ให้แอดมิน:\n"
+            )
+        elif is_macos:
+            cause_hint = (
+                f"พบ {adb_name} แต่รันไม่ได้ (อาจถูก macOS Gatekeeper บล็อก\n"
+                "หรือไฟล์ไม่มี execute permission)"
+            )
+            help_steps = (
+                f"1. เปิด Terminal แล้วพิมพ์:  chmod +x \"<path>/{adb_name}\"\n"
+                f"   (path เห็นข้างบน) แล้วเปิด NP Create อีกครั้ง\n"
+                "2. ถ้ายังไม่ผ่าน ลอง: System Settings → Privacy & Security\n"
+                f"   → กด 'Allow Anyway' ถ้าเห็นการบล็อก {adb_name}\n"
+                "3. ส่งไฟล์ diagnostic ให้แอดมิน:\n"
+            )
+        else:
+            # Linux fallback.
+            cause_hint = (
+                f"พบ {adb_name} แต่รันไม่ได้ (ตรวจสอบ execute permission\n"
+                "หรือ libc/library version ไม่ตรง)"
+            )
+            help_steps = (
+                f"1. ลอง:  chmod +x \"<path>/{adb_name}\"  ตามตำแหน่งข้างบน\n"
+                "2. ส่งไฟล์ diagnostic ให้แอดมิน:\n"
+            )
+
         broken_reason: str | None = None
         if not adb_path or (
             adb_path.is_absolute() and not adb_path.is_file()
         ):
             broken_reason = (
-                f"ไม่พบ adb.exe ที่ตำแหน่ง:\n  {adb_path}"
+                f"ไม่พบ {adb_name} ที่ตำแหน่ง:\n  {adb_path}"
             )
         elif not self.adb.is_available():
-            broken_reason = (
-                "พบ adb.exe แต่รันไม่ได้ (อาจถูก antivirus กักหรือ\n"
-                "ขาด Visual C++ Redistributable)"
-            )
+            broken_reason = cause_hint
 
         if broken_reason is None:
             return
@@ -814,13 +854,11 @@ class StudioApp(ctk.CTk):
         messagebox.showwarning(
             "NP Create — adb ไม่พร้อมใช้งาน",
             (
-                "ไม่สามารถใช้งาน adb.exe ที่บันเดิลมาในโปรแกรมได้ครับ\n"
+                f"ไม่สามารถใช้งาน {adb_name} ที่บันเดิลมาในโปรแกรมได้ครับ\n"
                 "หน้า 'เพิ่มเครื่อง' จะค้างที่ 'รอเครื่อง...' เพราะเหตุนี้\n\n"
                 f"{broken_reason}\n\n"
                 "วิธีช่วยแก้ไข\n"
-                "1. รีสตาร์ทเครื่อง แล้วเปิด NP Create อีกครั้ง\n"
-                "2. ตรวจสอบว่า Windows Defender ไม่กัก adb.exe ไว้\n"
-                "3. ส่งไฟล์ diagnostic ให้แอดมิน:\n"
+                f"{help_steps}"
                 f"   {diag_path}\n\n"
                 "ติดต่อ Line OA: @npcreate"
             ),

@@ -143,6 +143,38 @@ class TestToolsRootBase:
             )
             assert pt.LEGACY_TOOLS_ROOT == tools_dir.resolve()
 
+    def test_macos_dev_app_in_vcampc_dist_finds_tools(self, tmp_path):
+        """v1.8.13 regression — admin smoke-tests the PyInstaller
+        bundle by running ``python tools/build_pyinstaller.py``
+        which lands the ``.app`` at
+        ``vcam-pc/dist/pyinstaller/NP-Create.app/Contents/MacOS/``.
+        The walk must climb six directories (MacOS → Contents →
+        .app → pyinstaller → dist → vcam-pc → workspace-root) to
+        reach ``.tools/`` — one more than the v1.8.4 customer-ZIP
+        layout. The 5-level cap shipped in v1.8.4 silently failed
+        this case and reproduced the v1.8.3 "every device shows
+        offline" symptom whenever admin tested locally.
+        """
+        workspace = tmp_path / "livemobillrerun"
+        tools_dir = workspace / ".tools"
+        tools_dir.mkdir(parents=True)
+        macos_dir = (
+            workspace / "vcam-pc" / "dist" / "pyinstaller"
+            / "NP-Create.app" / "Contents" / "MacOS"
+        )
+        macos_dir.mkdir(parents=True)
+
+        with mock.patch.object(sys, "frozen", True, create=True):
+            pt = _reload_platform_tools(macos_dir)
+            assert pt._tools_root_base() == workspace, (
+                "Walk must escape Contents/MacOS/ → Contents/ → "
+                ".app/ → pyinstaller/ → dist/ → vcam-pc/ → workspace, "
+                "or admin's dev .app silently breaks find_adb on launch "
+                "even though ``.tools/`` is right there at the workspace "
+                "root."
+            )
+            assert pt.LEGACY_TOOLS_ROOT == tools_dir.resolve()
+
     def test_walk_does_not_escape_to_user_home(self, tmp_path):
         """Bound the walk so a missing ``.tools/`` doesn't accidentally
         find one in a parent path the customer didn't intend (e.g.
