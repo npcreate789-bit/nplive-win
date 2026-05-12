@@ -760,6 +760,21 @@ class CameraHook : IXposedHookLoadPackage {
      *
      * Safe to call on a Surface that was never wrapped — both
      * lookups return null and the method becomes a no-op.
+     *
+     * v1.8.14 freeze-on-flip fix
+     * --------------------------
+     * Pre-v1.8.14 this method only called ``fr.stop()`` / ``rx.stop()``
+     * but left the entries in ``FlipRenderer.instances`` /
+     * ``StreamReceiver.instances`` behind. The customer flipping
+     * BACK → FRONT → BACK then hit ``wrapWithFlipRenderer`` which
+     * checks ``FlipRenderer.instances[outputSurface]`` *before*
+     * deciding to build a fresh renderer — and got the DEAD
+     * instance from the previous BACK session, returning its
+     * already-released input Surface. VideoFeeder wrote frames into
+     * a dead surface → encoder saw no input → preview froze on
+     * the last good frame. Same hazard on the StreamReceiver path
+     * for the live-RTMP flow. We now REMOVE the entries after
+     * stopping so the next BACK addTarget builds a clean pipeline.
      */
     private fun stopAnyInjectionFor(surface: Surface) {
         val fr = FlipRenderer.instances[surface]
@@ -771,11 +786,26 @@ class CameraHook : IXposedHookLoadPackage {
             if (input != null) VideoFeeder.stopFor(input)
             runCatching { fr.stop() }
                 .onFailure { log("FlipRenderer.stop() failed on $surface: $it") }
+            // Drop the dead entry so the next BACK flip builds a
+            // fresh renderer instead of resurrecting this one.
+            FlipRenderer.instances.remove(surface)
             log("⏹ stopped injection for $surface (facing change)")
         } else {
             // No FlipRenderer wrap — but the camera/preview path
             // may have fed the surface directly. Stop just in case.
             VideoFeeder.stopFor(surface)
+        }
+
+        // Same cleanup for the live-stream RTMP path. ``rx.stop()``
+        // released the socket + codec but the instances map kept the
+        // entry, so a subsequent BACK flip would have re-used a dead
+        // receiver and never reconnected to the producer side.
+        val rx = StreamReceiver.instances[surface]
+        if (rx != null) {
+            runCatching { rx.stop() }
+                .onFailure { log("StreamReceiver.stop() failed on $surface: $it") }
+            StreamReceiver.instances.remove(surface)
+            log("⏹ dropped StreamReceiver entry for $surface")
         }
     }
 
