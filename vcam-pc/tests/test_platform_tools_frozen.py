@@ -143,6 +143,59 @@ class TestToolsRootBase:
             )
             assert pt.LEGACY_TOOLS_ROOT == tools_dir.resolve()
 
+    def test_macos_app_at_zip_root_finds_tools(self, tmp_path):
+        """v1.8.13+ customer ZIP layout — the .app sits at the ZIP
+        root (``<bundle>/NP-Create.app/``) rather than the previous
+        ``<bundle>/app/NP-Create.app/`` subdirectory. Layout::
+
+            <bundle>/
+              .tools/                                  ← the goal
+              NP-Create.app/
+                Contents/
+                  MacOS/                               ← PROJECT_ROOT
+
+        The walk now climbs only three directories (MacOS → Contents
+        → NP-Create.app → bundle) — one less than the v1.8.12 layout.
+        Pin the contract so a future refactor that "tightens the
+        cap" can't regress the resolver back to 5 levels and find
+        the workspace ``.tools/`` from inside the test's tmp tree.
+        """
+        bundle = tmp_path / "NP-Create-customer-macos-1.8.13"
+        tools_dir = bundle / ".tools"
+        tools_dir.mkdir(parents=True)
+        macos_dir = bundle / "NP-Create.app" / "Contents" / "MacOS"
+        macos_dir.mkdir(parents=True)
+
+        with mock.patch.object(sys, "frozen", True, create=True):
+            pt = _reload_platform_tools(macos_dir)
+            assert pt._tools_root_base() == bundle, (
+                "ZIP-root .app layout must still resolve .tools/ — "
+                "the walk has three hops to climb (MacOS → Contents "
+                "→ .app → bundle) which is the shortest customer-"
+                "facing layout we ship."
+            )
+            assert pt.LEGACY_TOOLS_ROOT == tools_dir.resolve()
+
+    def test_windows_exe_at_zip_root_finds_tools(self, tmp_path):
+        """v1.8.13+ Windows customer ZIP layout — NP-Create.exe sits
+        at the ZIP root (``<bundle>/NP-Create.exe``) with .tools/ as
+        a sibling. Frozen mode resolves PROJECT_ROOT to the exe's
+        parent dir, which IS the bundle root, so the walk finds
+        .tools/ on the first iteration.
+        """
+        bundle = tmp_path / "NP-Create-customer-windows-1.8.13"
+        tools_dir = bundle / ".tools"
+        tools_dir.mkdir(parents=True)
+        bundle.mkdir(parents=True, exist_ok=True)
+
+        with mock.patch.object(sys, "frozen", True, create=True):
+            pt = _reload_platform_tools(bundle)
+            assert pt._tools_root_base() == bundle, (
+                "Windows ZIP-root .exe layout: PROJECT_ROOT IS the "
+                "bundle root, so .tools/ is found on iteration 1 "
+                "without walking up at all."
+            )
+
     def test_macos_dev_app_in_vcampc_dist_finds_tools(self, tmp_path):
         """v1.8.13 regression — admin smoke-tests the PyInstaller
         bundle by running ``python tools/build_pyinstaller.py``

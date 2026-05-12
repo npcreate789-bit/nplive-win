@@ -113,25 +113,29 @@ def _tools_root_base() -> Path:
       ``PROJECT_ROOT`` = ``Contents/MacOS/``. ``.tools/`` sits
       inside PROJECT_ROOT.
 
-    * **Portable ZIP with PyInstaller bundle in app/** (some
-      customers double-click ``app/NP-Create.exe`` from inside the
-      portable ZIP instead of using ``run.bat``). Frozen mode,
-      ``PROJECT_ROOT`` = ``<bundle>/app/``. ``.tools/`` sits at
-      ``<bundle>/.tools/`` — *parent* of PROJECT_ROOT.
+    * **Customer ZIP, native binary at ZIP root** (v1.8.13+ ship
+      layout). The PyInstaller bundle sits AT THE ROOT of the ZIP —
+      ``<bundle>/NP-Create.app/`` (macOS) or ``<bundle>/NP-Create.exe``
+      (Windows) — alongside ``.tools/``, ``apk/`` and ``MANUAL_TH.md``.
+      The launcher script (``run.bat`` / ``run.command``) is OMITTED
+      from this layout because the binary self-contains its own
+      Python runtime; one entry point keeps the customer's first
+      unzip view unambiguous. PROJECT_ROOT on macOS =
+      ``<bundle>/NP-Create.app/Contents/MacOS/`` (3 hops below
+      ``.tools/``); on Windows = ``<bundle>/`` directly so the
+      walk finds ``.tools/`` on iteration one.
 
-    * **macOS portable ZIP, .app double-clicked from Finder** —
-      the customer ZIP ships a PyInstaller .app at
-      ``<bundle>/app/NP-Create.app/`` *plus* the ``run.command``
-      launcher at the root. Some customers (and admins giving
-      remote support) follow the macOS muscle-memory of
-      "find the .app, double-click it" instead of the documented
-      ``run.command`` path. In that mode ``PROJECT_ROOT`` =
-      ``<bundle>/app/NP-Create.app/Contents/MacOS/`` — i.e. four
-      directory levels below ``.tools/``. The 1.8.3 release
-      regressed silently here because the previous 3-level walk
-      stopped at ``NP-Create.app/`` and returned None for adb /
-      ffmpeg / lspatch / vcam_apk, leaving the dashboard stuck
-      with every device showing offline forever.
+    * **Legacy customer ZIP, .app nested under app/** (v1.8.12
+      and earlier). Some old customer downloads still ship the
+      PyInstaller bundle at ``<bundle>/app/NP-Create.app/`` next
+      to ``run.command``. PROJECT_ROOT =
+      ``<bundle>/app/NP-Create.app/Contents/MacOS/`` — 4 hops
+      below ``.tools/``. The 1.8.3 release regressed silently
+      here because the then-3-level walk stopped at
+      ``NP-Create.app/`` and returned None for every tool. The
+      bound has been bumped to 7 in v1.8.13 so old + new layouts
+      both resolve, and ``tests/test_platform_tools_frozen.py``
+      pins all the cases.
 
     * **macOS dev build — .app sitting inside the source tree**
       (v1.8.13+). Admin runs ``python tools/build_pyinstaller.py``

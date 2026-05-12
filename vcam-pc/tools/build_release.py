@@ -270,7 +270,14 @@ def _add_prebuilt_app(
                     continue
                 full = Path(dirpath) / fname
                 rel = full.relative_to(prebuilt_dir).as_posix()
-                arcname = f"{prefix}/app/{rel}"
+                # v1.8.13+: ZIP-root placement — ``<bundle>/NP-Create.app``
+                # rather than the previous ``<bundle>/app/NP-Create.app``.
+                # Dropping the ``app/`` subdirectory means customers see
+                # the icon immediately on unzip (no need to descend into
+                # a subfolder) AND it shortens the platform_tools walk by
+                # one level (3 hops MacOS→Contents→.app→bundle vs 4),
+                # which keeps the resolver well inside the 7-level cap.
+                arcname = f"{prefix}/{rel}"
                 if full.is_symlink():
                     target = os.readlink(full)
                     zinfo = zipfile.ZipInfo(arcname)
@@ -293,7 +300,10 @@ def _add_prebuilt_app(
     elif os_name == "windows":
         exe = prebuilt_dir / "NP-Create.exe"
         if exe.is_file():
-            zf.write(exe, f"{prefix}/app/NP-Create.exe")
+            # v1.8.13+: ZIP-root placement (see macOS branch above for
+            # the same rationale — icon visible immediately, shorter
+            # platform_tools walk to find .tools/ next to the exe).
+            zf.write(exe, f"{prefix}/NP-Create.exe")
             n += 1
     return n
 
@@ -571,18 +581,27 @@ def _readme(target: str, os_name: str, *, has_prebuilt_app: bool = False) -> str
 
     if has_prebuilt_app:
         # Lead with the native binary — no Python installation needed.
-        # The .app sits at ``<bundle>/app/NP-Create.app`` (macOS) or
-        # ``<bundle>/app/NP-Create.exe`` (Windows); see ``_add_prebuilt_app``
-        # for why we nest under ``app/`` (the production layout that
-        # ``platform_tools._tools_root_base`` is built for).
+        # v1.8.13+ ship: the binary sits at the ZIP root
+        # (``<bundle>/NP-Create.app`` or ``<bundle>/NP-Create.exe``)
+        # rather than the previous ``app/`` subdirectory, so the
+        # customer's first unzip view shows the icon immediately and
+        # they don't have to know what "app" means.
+        #
+        # When the binary is shipped we OMIT the run.bat / run.command
+        # launcher from the ZIP entirely (build_one skips writing it).
+        # That keeps the customer bundle layout unambiguous — one
+        # entry point, double-click and go. The README therefore
+        # mentions ONLY the binary path with no "alternatively use
+        # run.command" footnote (the launcher isn't in the ZIP for
+        # them to find anyway).
         binary_name = (
-            "app/NP-Create.exe" if os_name == "windows"
-            else "app/NP-Create.app"
+            "NP-Create.exe" if os_name == "windows"
+            else "NP-Create.app"
         )
         sec_install = textwrap.dedent(f"""\
             ## เริ่มต้นใช้งานเร็ว ๆ (Quick Start) ⚡
 
-            **วิธีง่ายที่สุด — ไม่ต้องลง Python**
+            **ไม่ต้องลง Python — ดับเบิ้ลคลิกใช้งานได้เลย**
 
             1. แตก zip นี้ไว้ที่ Desktop
             2. ดับเบิ้ลคลิก `{binary_name}` (ใช้งานได้ทันที)
@@ -591,18 +610,6 @@ def _readme(target: str, os_name: str, *, has_prebuilt_app: bool = False) -> str
 
             > **อ่านคู่มือฉบับเต็ม** ใน `MANUAL_TH.md` (วิธีต่อ WiFi, แก้ปัญหา,
             > FAQ และอื่น ๆ ครบทุกข้อ)
-
-            ### ทางเลือก: ใช้ Python ของตัวเอง (ขั้นสูง)
-
-            ถ้าคุณติดตั้ง Python 3.13 ไว้แล้ว และอยากใช้ตัวนั้นแทน:
-
-            1. ลง Python 3.13 จาก https://www.python.org/downloads
-               {'(สำคัญ: ติ๊ก "Add Python to PATH" ตอนลง)' if os_name == 'windows' else ''}
-            2. ดับเบิ้ลคลิก `{'run.bat' if os_name == 'windows' else 'run.command'}` แทน
-            3. รอ ~30 วินาที (ติดตั้ง dependencies ครั้งแรก)
-
-            > วิธีนี้ใช้สำหรับ debug หรือทดสอบเวอร์ชัน Python ที่เฉพาะเจาะจง.
-            > ลูกค้าทั่วไปแนะนำให้ใช้ `{binary_name}` ด้านบนเพราะง่ายกว่า.
 
             ## ติดต่อแอดมิน
 
@@ -776,6 +783,50 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
 
         # ── tools (.tools/<os>/) ────────────────────────────────
         if tools_dir:
+            # v1.8.13 fix: shipping silently-broken symlinks bug.
+            # ``.tools/<os>/jdk-21`` is sometimes a symlink to the
+            # legacy ``.tools/jdk-21/`` (when setup_macos_tools.py
+            # was run against a previous home dir, e.g. an older
+            # admin's user path). os.walk(followlinks=True) silently
+            # skips broken symlinks → the resulting ZIP ships
+            # ``.tools/macos/`` with ffmpeg + scrcpy + mediamtx
+            # only, NO jdk-21 / lspatch / platform-tools. The
+            # customer .app then crashes on first Patch click with
+            # "Java 0 is too old" + "lspatch.jar missing" because
+            # nothing in find_java / find_lspatch_jar's search
+            # tree exists. Pre-flight check warns BEFORE we waste
+            # 5 minutes packing a 290 MB ZIP that's broken.
+            critical = {
+                "jdk-21": tools_dir / "jdk-21",
+                "lspatch": tools_dir / "lspatch",
+                "platform-tools": tools_dir / "platform-tools",
+            }
+            broken_critical: list[str] = []
+            for name, p in critical.items():
+                # Symlink that doesn't resolve → broken. ``exists``
+                # follows the link and reports the underlying target.
+                if p.is_symlink() and not p.exists():
+                    broken_critical.append(
+                        f".tools/{os_name}/{name} → "
+                        f"{os.readlink(p)} (target missing)"
+                    )
+            if broken_critical:
+                print(
+                    "   [!] BROKEN SYMLINKS detected — these would ship "
+                    "as empty dirs:",
+                    file=sys.stderr,
+                )
+                for line in broken_critical:
+                    print(f"       • {line}", file=sys.stderr)
+                print(
+                    "       Re-run setup_macos_tools.py / setup_windows_tools.py "
+                    "on THIS machine OR re-create the symlinks pointing at "
+                    f"{WORKSPACE / '.tools'} on this user's account before "
+                    "building. The customer .app would otherwise crash with "
+                    "'Java 0 is too old' / 'lspatch.jar missing' on first Patch.",
+                    file=sys.stderr,
+                )
+
             n_t = 0
             for f in _walk_filtered(tools_dir, _SHIP_SKIP_NAMES):
                 rel = f.relative_to(tools_dir).as_posix()
@@ -824,25 +875,16 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
                         file=sys.stderr,
                     )
 
-        # ── launcher + README ───────────────────────────────────
-        launcher = LAUNCHER_NAMES[os_name]
-        body = _launcher_body(os_name)
-        info = zipfile.ZipInfo(f"{prefix}/{launcher}")
-        # 0o100755 = regular file with -rwxr-xr-x. zip stores Unix
-        # mode in the high 16 bits of external_attr; Finder + Linux
-        # honour this, so the customer can double-click without
-        # `chmod +x` first. (Windows ignores the bit harmlessly.)
-        info.external_attr = (0o100755 << 16) if os_name != "windows" else (0o100644 << 16)
-        info.compress_type = zipfile.ZIP_DEFLATED
-        zf.writestr(info, body)
-
         # ── prebuilt .app/.exe (optional) ───────────────────────
         # If the admin ran `tools/build_pyinstaller.py` first, we
-        # bundle the resulting native binary alongside the Python
-        # script tree. The customer can then choose:
-        #   • Double-click NP-Create.app/.exe — works without Python
-        #   • Or run.bat / run.command — uses their installed Python
-        # We never *require* the prebuilt; missing is OK.
+        # bundle the resulting native binary alongside the rest of
+        # the customer ZIP. When the binary is present the customer
+        # doesn't need Python at all and the launcher script
+        # (run.bat / run.command) becomes dead weight — so v1.8.13+
+        # SKIPS the launcher entirely whenever the binary for that
+        # OS is in the bundle. Missing-binary ZIPs still get the
+        # Python-only launcher + INSTALL_TH.txt + README so legacy
+        # flows keep working unchanged.
         prebuilt_dir = PROJECT / "dist" / "pyinstaller"
         has_prebuilt_app = False
         if prebuilt_dir.is_dir():
@@ -863,10 +905,33 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
                     f"dist/pyinstaller — Python-only bundle)"
                 )
 
-        # README is written AFTER the prebuilt-detection probe so its
-        # copy can match what the ZIP actually contains. Customer
-        # opening a Python-only bundle gets the legacy run.bat copy;
-        # one with the .app/.exe gets the "just double-click" lead.
+        # ── launcher (only when no native binary present) ───────
+        # We OMIT run.bat / run.command from the ZIP when the
+        # binary entry is bundled — they'd just confuse the
+        # customer ("which one do I double-click?") and shipping
+        # both makes the ZIP layout look unfinished. The README
+        # branch below mirrors the decision: binary-only bundles
+        # describe ONLY the .app/.exe path with no Python
+        # fallback footnote.
+        if not has_prebuilt_app:
+            launcher = LAUNCHER_NAMES[os_name]
+            body = _launcher_body(os_name)
+            info = zipfile.ZipInfo(f"{prefix}/{launcher}")
+            # 0o100755 = regular file with -rwxr-xr-x. zip stores Unix
+            # mode in the high 16 bits of external_attr; Finder + Linux
+            # honour this, so the customer can double-click without
+            # `chmod +x` first. (Windows ignores the bit harmlessly.)
+            info.external_attr = (0o100755 << 16) if os_name != "windows" else (0o100644 << 16)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, body)
+        else:
+            print(f"   {LAUNCHER_NAMES[os_name]:8s}: (omitted — native binary handles launch)")
+
+        # README copy reflects what the ZIP actually contains. A
+        # binary-only bundle gets the "double-click app/NP-Create.app"
+        # lead with no run.bat fallback footnote (the launcher isn't
+        # in the ZIP anyway). A Python-only bundle gets the legacy
+        # run.bat / run.command copy bit-for-bit.
         zf.writestr(
             f"{prefix}/README_TH.md",
             _readme(target, os_name, has_prebuilt_app=has_prebuilt_app),
@@ -878,7 +943,9 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
         # Python is missing the .bat shows English instructions
         # only — INSTALL_TH.txt sits next to run.bat as the Thai
         # mirror so non-English customers still know what to do.
-        if os_name == "windows":
+        # Skip it for binary-only ZIPs because there's no run.bat
+        # to clarify the Thai instructions for in the first place.
+        if os_name == "windows" and not has_prebuilt_app:
             zf.writestr(f"{prefix}/INSTALL_TH.txt", _windows_install_thai())
 
         # ── full Thai manual (always shipped, customer-friendly) ─

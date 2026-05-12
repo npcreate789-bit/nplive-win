@@ -63,30 +63,53 @@ class TestReadmeWithoutPrebuilt:
 
 
 class TestReadmeWithPrebuilt:
-    """v1.8.13 ship: bundle carries the PyInstaller .app/.exe."""
+    """v1.8.13 ship: bundle carries the PyInstaller .app/.exe.
+
+    Design choice — when the binary is shipped, the README must NOT
+    mention run.bat / run.command. That's because build_release.py
+    OMITS the launcher script from the bundle entirely (one entry
+    point, no ambiguity); telling the customer to look for a file
+    that isn't there would be a regression bug, not a feature.
+    """
 
     def test_windows_leads_with_exe(self):
         text = build_release._readme(
             "customer", "windows", has_prebuilt_app=True,
         )
-        # Primary entry — the easy-mode binary path.
-        assert "app/NP-Create.exe" in text
-        # run.bat must still appear (fallback for power users) but
-        # be DEMOTED out of the headline step. The "ทางเลือก: ใช้
-        # Python ของตัวเอง (ขั้นสูง)" sub-heading is the marker.
-        assert "run.bat" in text
-        assert "ทางเลือก" in text
+        # Primary entry — the easy-mode binary path. The path is
+        # the ZIP root (no ``app/`` prefix) so the icon is visible
+        # immediately when the customer unzips.
+        assert "`NP-Create.exe`" in text
+        # Defensive: the OLD ``app/NP-Create.exe`` path must NOT
+        # appear — that's the v1.8.12 layout we shipped briefly and
+        # which the v1.8.13 layout supersedes. Catching a regression
+        # here means we can't accidentally re-introduce the
+        # subdirectory and confuse customers reading two different
+        # READMEs.
+        assert "app/NP-Create.exe" not in text
         # The lead-in copy explicitly says "no Python install needed".
         assert "ไม่ต้องลง Python" in text
+        # run.bat MUST NOT appear in the customer README when the
+        # binary is shipped — it isn't in the ZIP, so a mention
+        # would send the customer hunting for a missing file.
+        assert "run.bat" not in text
+        # Same for the demoted "ทางเลือก: ใช้ Python" sub-heading
+        # — it's the marker for the dual-launcher layout we used
+        # before v1.8.13 and is no longer present.
+        assert "ทางเลือก" not in text
 
     def test_macos_leads_with_app(self):
         text = build_release._readme(
             "customer", "macos", has_prebuilt_app=True,
         )
-        assert "app/NP-Create.app" in text
-        assert "run.command" in text
-        assert "ทางเลือก" in text
+        # ZIP-root placement — no ``app/`` prefix.
+        assert "`NP-Create.app`" in text
+        assert "app/NP-Create.app" not in text
         assert "ไม่ต้องลง Python" in text
+        # No run.command reference — the launcher script was
+        # removed from binary-bundled ZIPs in v1.8.13.
+        assert "run.command" not in text
+        assert "ทางเลือก" not in text
 
     def test_admin_bundle_documents_with_app_flag(self):
         """Admin README must surface the new --with-app build option
