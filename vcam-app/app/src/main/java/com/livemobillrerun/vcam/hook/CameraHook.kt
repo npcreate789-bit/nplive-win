@@ -601,8 +601,33 @@ class CameraHook : IXposedHookLoadPackage {
         /** Horizontal flip baseline like TikTok front preview (selfie mirror). */
         mirrorLikeFrontCamera: Boolean = false,
     ): Surface? {
-        // Re-use an existing renderer if we already wrapped this surface.
-        FlipRenderer.instances[outputSurface]?.let { return it.inputSurface }
+        // v1.8.14 freeze-on-flip belt-and-braces: re-use an existing
+        // renderer only when it is still ALIVE. A dead renderer (GL
+        // thread quit, input surface invalid) leaves a poisoned entry
+        // in ``instances`` that resurrects on the next BACK flip and
+        // routes MediaPlayer frames into a dead EGL window — TikTok
+        // preview then freezes on whatever frame was last drawn. The
+        // explicit ``FlipRenderer.instances.remove`` in
+        // ``stopAnyInjectionFor`` is the first line of defence; this
+        // check covers any path that wedges the renderer without
+        // going through the normal teardown (GL driver crash, OS
+        // killing the EGL context on app backgrounding, etc.).
+        FlipRenderer.instances[outputSurface]?.let { existing ->
+            val input = existing.inputSurface
+            val threadAlive = runCatching {
+                existing.isAlive()
+            }.getOrDefault(true)
+            if (input != null && input.isValid && threadAlive) {
+                return input
+            }
+            log(
+                "wrapWithFlipRenderer: dropping stale instance for " +
+                    "$outputSurface (input=${input}, valid=" +
+                    "${input?.isValid}, threadAlive=$threadAlive)"
+            )
+            runCatching { existing.stop() }
+            FlipRenderer.instances.remove(outputSurface)
+        }
         // NB: we used to call FlipRenderer.stopOthers() here to keep
         // memory bounded, but that killed the preview pipeline the
         // moment TikTok created a *second* encoder for Live broadcast

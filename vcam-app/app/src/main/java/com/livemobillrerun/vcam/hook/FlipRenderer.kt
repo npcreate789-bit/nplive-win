@@ -84,6 +84,17 @@ class FlipRenderer(
     private val thread = HandlerThread("vcam-fliprender").apply { start() }
     private val handler = Handler(thread.looper)
 
+    /**
+     * Public liveness probe used by [CameraHook.wrapWithFlipRenderer]
+     * to decide whether the cached instance can be re-used on a flip-
+     * back-to-BACK transition. Returns false after [stop] has been
+     * called AND the GL thread has actually quit (we check
+     * ``thread.isAlive`` rather than a flag because ``stop()`` posts
+     * an async teardown and the flag would be set before the thread
+     * actually shuts down).
+     */
+    fun isAlive(): Boolean = thread.isAlive
+
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
@@ -127,7 +138,33 @@ class FlipRenderer(
     }
 
     fun stop() {
-        handler.post { teardownGl() }
+        // v1.8.14 freeze-on-flip fix: pre-v1.8.14 this method posted
+        // teardownGl and returned **immediately**. The hooked thread
+        // would then synchronously build a fresh FlipRenderer for the
+        // SAME outputSurface (the BACK→FRONT→BACK flip path), and the
+        // new ``eglCreateWindowSurface`` call would race the still-
+        // pending teardown of the old EGL window — Mali / Adreno
+        // drivers reject the second window with EGL_BAD_NATIVE_WINDOW
+        // or hand back a non-current context. The visible symptom on
+        // TikTok was "BACK preview frozen on last good frame after
+        // flipping back from FRONT" because the new renderer's
+        // ``setupGl`` silently failed but the MediaPlayer kept
+        // pumping frames into an EGL window that no longer mapped to
+        // anything. Wait (bounded) for the teardown to complete so
+        // the next start() sees a clean Surface.
+        val latch = java.util.concurrent.CountDownLatch(1)
+        handler.post {
+            runCatching { teardownGl() }
+            latch.countDown()
+        }
+        // Cap at 1 s — the GL teardown is just a handful of
+        // eglDestroySurface / eglDestroyContext calls. If it really
+        // takes longer than that, the driver is wedged and waiting
+        // would just freeze TikTok itself; bail and let the next
+        // start() take its chances.
+        runCatching {
+            latch.await(1, java.util.concurrent.TimeUnit.SECONDS)
+        }
         thread.quitSafely()
     }
 
