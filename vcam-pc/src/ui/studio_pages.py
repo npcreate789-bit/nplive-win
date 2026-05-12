@@ -927,7 +927,7 @@ class DashboardPage(ctk.CTkFrame):
         # _on_encode_push, _render_encode_card_for, etc. don't need
         # to change.
         vid = _card(main)
-        vid.grid(row=3, column=0, sticky="ew", padx=20, pady=8)
+        vid.grid(row=4, column=0, sticky="ew", padx=20, pady=8)
         vid.grid_columnconfigure(0, weight=1)
         self.video_card = vid
         # Backward-compat: code that referenced ``action_card`` (e.g.
@@ -1004,7 +1004,7 @@ class DashboardPage(ctk.CTkFrame):
 
         # Rotation card
         rot = _card(main)
-        rot.grid(row=4, column=0, sticky="ew", padx=20, pady=8)
+        rot.grid(row=5, column=0, sticky="ew", padx=20, pady=8)
         rot.grid_columnconfigure(0, weight=1)
         self.rotation_card = rot
 
@@ -1054,7 +1054,7 @@ class DashboardPage(ctk.CTkFrame):
 
         # Audio card — separate audio file overrides the MP4's audio.
         aud = _card(main)
-        aud.grid(row=5, column=0, sticky="ew", padx=20, pady=8)
+        aud.grid(row=6, column=0, sticky="ew", padx=20, pady=8)
         aud.grid_columnconfigure(0, weight=1)
         self.audio_card = aud
 
@@ -1117,17 +1117,22 @@ class DashboardPage(ctk.CTkFrame):
         # Driving start/stop from the PC saves them walking between
         # 5 phones tapping things on each.
         live_ctrl = _card(main)
-        live_ctrl.grid(row=6, column=0, sticky="ew", padx=20, pady=(8, 8))
+        live_ctrl.grid(row=7, column=0, sticky="ew", padx=20, pady=(8, 24))
         live_ctrl.grid_columnconfigure(0, weight=1)
         self.live_ctrl_card = live_ctrl
         self._build_live_control_card(live_ctrl)
 
-        # Open-TikTok / Patch row -- mostly a setup-time concern
-        # (first run / rebuilding after a TikTok update). Keep it
-        # at the bottom; the live-control card above is the one
-        # the customer reaches for daily.
+        # v1.8.14 UX: lifted "Open TikTok / Patch / Force-update Re-Patch"
+        # to row=3 — directly under the hook-status card so the customer
+        # who just clicked "ตรวจซ้ำ" and saw an unpatched / outdated
+        # state has the action buttons immediately below their finger
+        # instead of having to scroll past four cards (clip / rotation
+        # / audio / live-control). Previously this row sat at the
+        # bottom of the dashboard, which made the Patch button feel
+        # like an afterthought even though re-Patching is the most
+        # common recovery step after a TikTok auto-update.
         live = _card(main)
-        live.grid(row=7, column=0, sticky="ew", padx=20, pady=(8, 24))
+        live.grid(row=3, column=0, sticky="ew", padx=20, pady=(8, 8))
         live.grid_columnconfigure(0, weight=1)
         live.grid_columnconfigure(1, weight=1)
         self.live_card = live
