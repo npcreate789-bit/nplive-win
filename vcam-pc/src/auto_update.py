@@ -84,7 +84,7 @@ log = logging.getLogger(__name__)
 # point a single dev build at a staging URL without rebuilding.
 DEFAULT_MANIFEST_URL = os.environ.get(
     "NP_UPDATE_MANIFEST_URL",
-    "https://npcreate.github.io/updates/manifest.json",
+    "https://npcreate789-bit.github.io/nplive/updates/manifest.json",
 )
 
 # How often the app polls for new updates while running. 6 hours is
