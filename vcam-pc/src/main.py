@@ -12,6 +12,7 @@ In CLI mode, Ctrl+C stops cleanly.
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -23,6 +24,105 @@ from .health import HealthMonitor
 from .log_setup import configure_logging
 from .playlist import list_videos, write_playlist
 from .tcp_server import TcpStreamServer
+
+
+def _preflight_writable_install() -> bool:
+    """Detect a read-only install location (a customer running
+    NP-Create.app straight from the mounted .dmg) and refuse to
+    boot.
+
+    Why this exists
+    ---------------
+    The whole app — logs, config.json, device_profiles.json,
+    license activation ledger, update cache, sqlite — writes
+    relative to ``PROJECT_ROOT``. If the customer double-clicks
+    NP-Create.app while it's still inside the .dmg volume (which
+    macOS mounts read-only), the first ``logs/`` mkdir explodes
+    with ``OSError: [Errno 30] Read-only file system`` and they
+    see a stack-trace popup. The fix everyone expects on macOS
+    is the same as OBS / Discord / Notion: a clear dialog telling
+    them to drag the app to /Applications/ first.
+
+    Returns ``True`` when the install location is writable (boot
+    should continue). Returns ``False`` when it isn't (caller
+    must exit).
+
+    Skipped entirely in dev mode (``sys.frozen`` is False) so
+    running ``python -m src.main`` from the source tree keeps
+    working even on a read-only checkout.
+    """
+    if not getattr(sys, "frozen", False):
+        return True
+
+    # /Volumes/ is the macOS mount point for .dmg / external
+    # disks; if the .app sits there it's almost certainly the
+    # "double-clicked from the disk image" case. We still verify
+    # with an actual write so we don't refuse to boot on a
+    # writable external SSD a power user picked.
+    looks_like_volume = str(PROJECT_ROOT).startswith("/Volumes/")
+
+    probe = PROJECT_ROOT / ".npcreate-writable-probe"
+    try:
+        probe.write_bytes(b"")
+        probe.unlink()
+        return True
+    except OSError as e:
+        # EROFS (30) = read-only filesystem; EACCES (13) = no
+        # write permission. Either way we can't run safely here.
+        if e.errno not in (30, 13) and not looks_like_volume:
+            # Unexpected error — let the normal startup path
+            # surface it so we don't mask an actual bug.
+            return True
+
+    # Show a friendly Tk dialog. We import tkinter lazily because
+    # this preflight runs BEFORE configure_logging() and we want
+    # to keep the import surface minimal in the happy path.
+    title = "NP Create — กรุณาติดตั้งก่อนเปิดใช้งาน"
+    if looks_like_volume:
+        message = (
+            "ตอนนี้คุณกำลังเปิด NP Create จากในแผ่นภาพดิสก์ (.dmg)\n"
+            "ซึ่งเป็นพื้นที่อ่านอย่างเดียว ทำให้โปรแกรมเขียน\n"
+            "ค่าตั้งค่า / log / cache ไม่ได้\n\n"
+            "วิธีติดตั้งให้ถูกต้อง:\n"
+            "  1. ลาก  NP-Create  ใส่ทางลัด  Applications  ในหน้าต่างเดียวกัน\n"
+            "  2. ปิดหน้าต่างนี้ (Eject) แผ่นภาพดิสก์\n"
+            "  3. เปิด  NP-Create  จาก  /Applications/  (Launchpad / Finder)\n\n"
+            "โปรแกรมจะปิดตัวเองตอนนี้ — เปิดอีกครั้งหลังลากเสร็จได้เลยครับ"
+        )
+    else:
+        message = (
+            "NP Create ติดตั้งอยู่ในตำแหน่งที่เขียนไฟล์ไม่ได้:\n"
+            f"  {PROJECT_ROOT}\n\n"
+            "กรุณาย้ายโปรแกรมไป /Applications/ หรือโฟลเดอร์ที่\n"
+            "เขียนได้ก่อนเปิดใช้งานครับ"
+        )
+
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        # Foreground the dialog so the customer actually sees it
+        # — without this the box sometimes drops behind the
+        # Finder window the customer just clicked from.
+        root.attributes("-topmost", True)
+        messagebox.showwarning(title, message)
+        root.destroy()
+    except Exception:
+        # If Tk itself can't initialise we have bigger problems;
+        # falling through to stderr at least gives the support
+        # team something to read in a terminal capture.
+        sys.stderr.write(f"\n{title}\n\n{message}\n")
+
+    # Best-effort: bounce the user to Finder showing /Applications/
+    # so the "drag here" step is one click away from the warning.
+    try:
+        os.system('open /Applications/')
+    except Exception:
+        pass
+
+    return False
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -153,6 +253,13 @@ def run_legacy(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+
+    # Guard against the "launched from the .dmg" footgun BEFORE we
+    # touch any disk writer (configure_logging mkdir's a logs/ dir
+    # in PROJECT_ROOT, which crashes on a read-only mount).
+    if not _preflight_writable_install():
+        return 1
+
     _setup_logging(args.verbose)
 
     # Always emit a startup diagnostic. This is the file we ask
