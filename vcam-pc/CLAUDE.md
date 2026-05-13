@@ -243,6 +243,7 @@ Safety: `publish_update.py` refuses to overwrite a manifest at a higher version 
 - **macOS Gatekeeper** — `.app` bundles need `xattr -dr com.apple.quarantine` after fresh download or they refuse to launch
 - **Windows .exe with embedded ffmpeg/adb** — `tools/bin/` must be co-located with the .exe; relative path resolution in frozen builds is finicky (see `src/platform_tools.py`)
 - **`UpdatePoller` 30s startup delay** — Pack A added `kick()` to wake it on demand, but the initial 30s pause is still there. Tests use `poll_now()` directly.
+- **Python GC + Tk thread deadlock (commit `1a9a30e`)** — auto-GC running on a worker thread can finalise a Tk-owning object; the `__del__` routes via `Tkapp_ThreadSend` and blocks the worker until the main thread services it. If the main thread is meanwhile inside an `after()` callback waiting on a `threading.Lock`, you get a permanent idle freeze in minutes. Fix lives in `studio_app.py:__init__` — `gc.disable()` plus a 5 s `_gc_tick()` on the Tk thread. Do NOT re-enable auto-GC without re-introducing this hazard. Diagnosis recipe: `sample <pid> 3 -file /tmp/freeze.txt` and look for any background thread in `gc_collect_main → slot_tp_finalize → Tkapp_*` — that's the same bug recurring under a different finalizer.
 
 ---
 
