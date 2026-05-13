@@ -21,6 +21,7 @@ never touch Tk widgets from a worker thread directly.
 
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 import time
@@ -289,6 +290,33 @@ class StudioApp(ctk.CTk):
         # in the current state.
         self._adb_resolution_warned = False
         self.after(800, self._check_adb_or_warn)
+
+        # Disable Python's automatic generational GC and run cycle
+        # collection only from the Tk main thread on a 5 s timer.
+        #
+        # Why: with auto-GC on, a background worker can trip the
+        # generation-2 threshold during normal allocation. The
+        # collector then runs finalizers (``__del__`` / weakref
+        # callbacks) on that worker's thread. Any finalizer that
+        # touches Tk -- including CTk widget teardown -- routes the
+        # call to the main thread via ``Tkapp_ThreadSend`` and
+        # **blocks the worker** until the main thread services it.
+        # If the main thread happens to be inside an ``after()``
+        # callback that is itself waiting on a Python lock held by
+        # *another* worker, the three-way wait closes a deadlock
+        # cycle and the UI freezes permanently. Confirmed via
+        # ``sample`` stack dumps at /tmp/freeze_sample.txt — a GC
+        # thread was wedged on ``gc_collect_main → slot_tp_finalize
+        # → Tkapp_ThreadSend → Tcl_ConditionWait`` while the main
+        # thread was in ``PythonCmd → lock_PyThread_acquire_lock``.
+        #
+        # Trade-off: cycle-collection latency stretches to 5 s, so
+        # transient cyclic garbage (rare in this codebase) lingers
+        # a bit longer. Reference-counting still reclaims everything
+        # non-cyclic immediately. See bpo-14976 for upstream context.
+        gc.disable()
+        self._gc_interval_ms = 5000
+        self.after(self._gc_interval_ms, self._gc_tick)
 
         # ── runtime state
         self.license: VerifiedLicense | None = None
@@ -768,6 +796,23 @@ class StudioApp(ctk.CTk):
         return PRIVATE_KEY_PATH.is_file()
 
     # ── adb sanity check ─────────────────────────────────────────
+
+    def _gc_tick(self) -> None:
+        """Run cyclic garbage collection from the Tk main thread.
+
+        See the ``gc.disable()`` block in ``__init__`` for the
+        deadlock this prevents.
+        """
+        try:
+            gc.collect()
+        except Exception:
+            log.exception("gc.collect on main thread failed")
+        try:
+            self.after(self._gc_interval_ms, self._gc_tick)
+        except Exception:
+            # winfo destroyed during shutdown — silently let the
+            # timer chain die.
+            pass
 
     def _check_adb_or_warn(self) -> None:
         """Pop a one-shot dialog if the bundled adb is missing.
