@@ -263,8 +263,29 @@ class StudioApp(ctk.CTk):
         # to dig into Settings or a hidden About dialog. This is the
         # single most-asked support question after every release.
         self.title(f"{BRAND.name} v{BRAND.version} — {BRAND.tagline_th}")
-        self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
-        self.minsize(960, 640)
+        # v1.8.14 layout fix: pick an initial geometry that always
+        # fits on the customer's screen. Previously the 1100×720
+        # default could exceed the usable area on common SME
+        # laptops (1366×768 with Windows DPI 125-150% + taskbar),
+        # which pushed the sidebar footer below the screen edge and
+        # produced the "ปุ่มด้านล่างไม่แสดง" report. We now clamp the
+        # initial size to ~94 % of the available screen, center it,
+        # and lower the minsize floor so manual resizing on small
+        # displays cannot clip the footer either.
+        try:
+            screen_w = max(640, int(self.winfo_screenwidth()))
+            screen_h = max(480, int(self.winfo_screenheight()))
+        except Exception:
+            screen_w, screen_h = self.WIDTH, self.HEIGHT
+        init_w = min(self.WIDTH, int(screen_w * 0.94))
+        init_h = min(self.HEIGHT, int(screen_h * 0.92))
+        pos_x = max(0, (screen_w - init_w) // 2)
+        pos_y = max(0, (screen_h - init_h) // 3)  # bias upward, away from taskbar
+        self.geometry(f"{init_w}x{init_h}+{pos_x}+{pos_y}")
+        # minsize floor matches the smallest mainstream laptop
+        # display (1280×720) minus chrome — keeps the sidebar pack
+        # layout from ever having to clip the footer.
+        self.minsize(900, 560)
         self._install_window_icon()
 
         # ── shared services

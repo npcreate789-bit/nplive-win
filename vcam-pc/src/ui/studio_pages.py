@@ -375,13 +375,24 @@ class DashboardPage(ctk.CTkFrame):
             corner_radius=0,
         )
         side.grid(row=0, column=0, sticky="nsew")
-        side.grid_columnconfigure(0, weight=1)
-        side.grid_rowconfigure(2, weight=1)
         self.side = side
+
+        # v1.8.14 layout fix: switched the four direct children of
+        # ``side`` from grid → pack. The previous grid had
+        # ``rowconfigure(2, weight=1)`` on the device-scroll row, so
+        # on small laptop displays (1366×768 with Windows DPI 125-
+        # 150%) the natural sum of header + scroll + 6-button footer
+        # exceeded the sidebar height, and Tk silently rendered the
+        # footer row *below* the visible area — customer-facing
+        # symptom: "ปุ่มล่างไม่แสดง". Pack with ``side="bottom"`` on
+        # the footer claims its natural height first, then the scroll
+        # list takes whatever is left in the middle. The footer is
+        # therefore guaranteed visible regardless of window height
+        # or DPI scaling.
 
         # Header — small logo + product name, side by side.
         head = ctk.CTkFrame(side, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 4))
+        head.pack(side="top", fill="x", padx=14, pady=(14, 4))
         title_row = ctk.CTkFrame(head, fg_color="transparent")
         title_row.pack(anchor="w")
         logo_small = _logo(28)
@@ -420,22 +431,28 @@ class DashboardPage(ctk.CTkFrame):
             font=ctk.CTkFont(size=10),
         ).pack(anchor="w", pady=(0, 0))
 
-        ctk.CTkFrame(side, fg_color=THEME.divider, height=1).grid(
-            row=1, column=0, sticky="ew", padx=8, pady=8
+        ctk.CTkFrame(side, fg_color=THEME.divider, height=1).pack(
+            side="top", fill="x", padx=8, pady=8
         )
 
-        # Device list (scrollable)
+        # Footer buttons — packed BEFORE the scrollable list so it
+        # claims its natural height at the bottom of the sidebar.
+        # The scroll list (packed last with ``expand=True``) then
+        # fills only the leftover middle space.
+        foot = ctk.CTkFrame(side, fg_color="transparent")
+        foot.pack(side="bottom", fill="x", padx=14, pady=10)
+
+        # Device list (scrollable) — takes whatever space is left
+        # between the header and the footer.
         self.devices_scroll = ctk.CTkScrollableFrame(
             side,
             fg_color="transparent",
             scrollbar_button_color=THEME.bg_hover,
             scrollbar_button_hover_color=THEME.primary_dim,
         )
-        self.devices_scroll.grid(row=2, column=0, sticky="nsew", padx=6)
-
-        # Footer buttons
-        foot = ctk.CTkFrame(side, fg_color="transparent")
-        foot.grid(row=3, column=0, sticky="ew", padx=14, pady=10)
+        self.devices_scroll.pack(
+            side="top", fill="both", expand=True, padx=6,
+        )
 
         self.btn_add_device = _primary_button(
             foot,
