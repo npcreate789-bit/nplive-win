@@ -58,18 +58,56 @@ cd "$(dirname "$0")/.."
 PROJECT="$(pwd)"
 WORKSPACE="$(cd "$PROJECT/.." && pwd)"
 
+# ── Admin / customer build flavour ──────────────────────────────
+#
+# An admin build embeds ``.private_key`` next to the executable so
+# ``StudioApp.is_admin`` returns true and the "ออกคีย์ลูกค้า" button
+# in the sidebar footer reveals AdminPage. The customer build OMITS
+# the file — without it the property is False and the admin UI is
+# completely invisible.
+#
+# Two ways to flip into admin mode:
+#   1. ``bash tools/build_macos_dmg.sh --admin``
+#   2. ``NPCREATE_ADMIN_BUILD=1 bash tools/build_macos_dmg.sh``
+#
+# Output filenames differ on purpose so admin and customer artifacts
+# can never be confused for each other on disk.
+BUILD_FLAVOR="customer"
+if [[ "${NPCREATE_ADMIN_BUILD:-0}" == "1" ]]; then
+    BUILD_FLAVOR="admin"
+fi
+for arg in "$@"; do
+    if [[ "$arg" == "--admin" ]]; then
+        BUILD_FLAVOR="admin"
+    fi
+done
+
 VERSION="$(python3 -c 'import sys; sys.path.insert(0, "src"); from branding import BRAND; print(BRAND.version)')"
 OUT_DIR="$PROJECT/dist/installer"
 STAGING="$PROJECT/build/macos-dmg"
 APP_SRC="$PROJECT/dist/pyinstaller/NP-Create.app"
-DMG="$OUT_DIR/NP-Create-${VERSION}.dmg"
-VOL_NAME="NP Create ${VERSION}"
+
+if [[ "$BUILD_FLAVOR" == "admin" ]]; then
+    DMG="$OUT_DIR/NP-Create-Admin-${VERSION}.dmg"
+    VOL_NAME="NP Create Admin ${VERSION}"
+else
+    DMG="$OUT_DIR/NP-Create-${VERSION}.dmg"
+    VOL_NAME="NP Create ${VERSION}"
+fi
 
 echo
 echo " =============================================================="
 echo "  NP Create — macOS Installer (.dmg) Build"
 echo "  version : ${VERSION}"
+echo "  flavour : ${BUILD_FLAVOR}"
 echo " =============================================================="
+
+if [[ "$BUILD_FLAVOR" == "admin" ]]; then
+    echo
+    echo "  ⚠️  ADMIN BUILD — embeds .private_key signing seed"
+    echo "      DO NOT share this .dmg with customers."
+    echo
+fi
 
 # ── 0. Preflight ──────────────────────────────────────────────────
 if [[ ! -d "$APP_SRC" ]]; then
@@ -121,6 +159,26 @@ if [[ -f "$WORKSPACE/apk/vcam-app-release.apk" ]]; then
     mkdir -p "$APP_DST/Contents/MacOS/apk"
     cp "$WORKSPACE/apk/vcam-app-release.apk" \
        "$APP_DST/Contents/MacOS/apk/vcam-app-release.apk"
+fi
+
+# Admin-only: embed the Ed25519 ``.private_key`` signing seed.
+# StudioApp.is_admin checks ``(PROJECT_ROOT / ".private_key").is_file()``
+# which in frozen mode points at ``<.app>/Contents/MacOS/.private_key``
+# — exactly the file we drop here. Mode 0600 so only the user who
+# extracted the .dmg can read it; the install pipeline preserves
+# the bit via ``cp --preserve=mode`` semantics on macOS (default).
+if [[ "$BUILD_FLAVOR" == "admin" ]]; then
+    if [[ -f "$PROJECT/.private_key" ]]; then
+        cp "$PROJECT/.private_key" "$APP_DST/Contents/MacOS/.private_key"
+        chmod 600 "$APP_DST/Contents/MacOS/.private_key"
+        echo "      [admin] embedded .private_key"
+    else
+        echo
+        echo "  ❌ --admin requested but $PROJECT/.private_key does not exist."
+        echo "     Run tools/init_keys.py to generate a keypair first,"
+        echo "     or copy the existing .private_key into vcam-pc/."
+        exit 1
+    fi
 fi
 
 # Customer manual lives next to the .app inside the .dmg so it's
