@@ -4262,9 +4262,144 @@ class DashboardPage(ctk.CTkFrame):
         ):
             return
 
+        # Precheck — guards against the "Re-Patch loop" reported by
+        # customers on Nubia / ZTE / non-Google-certified devices.
+        # Symptom: customer follows the dialog, but Play Store
+        # silently refuses to update TikTok because the installed
+        # APK is signed with the LSPatch debug keystore (not the
+        # official TikTok cert). Re-Patch then pulls the SAME stale
+        # version, patches it again, and the Live broadcast endpoint
+        # still rejects it. Detect this by comparing the live
+        # versionName on the device with the one we recorded at the
+        # last successful patch — if they match AND the signature is
+        # still LSPatch, no actual Play Store update happened.
+        from ..hook_mode import TIKTOK_PACKAGE_DEFAULT
+        from ..hook_status import _KNOWN_LSPATCH_FINGERPRINT_PREFIXES
+
+        self.app.refresh_devices_now()
+        if not self.app.is_online(e.serial):
+            messagebox.showwarning(
+                "ต้อง USB",
+                "เสียบสาย USB เครื่องนี้ก่อน แล้วกดอีกครั้ง",
+            )
+            return
+
+        pkg = e.tiktok_package or TIKTOK_PACKAGE_DEFAULT
+        current_version = self._read_tiktok_version_on_device(
+            e.serial, pkg,
+        )
+        same_version = (
+            current_version
+            and e.patched_tiktok_version
+            and current_version == e.patched_tiktok_version
+        )
+        still_lspatch = any(
+            e.patched_signature.startswith(prefix)
+            for prefix in _KNOWN_LSPATCH_FINGERPRINT_PREFIXES
+            if e.patched_signature
+        )
+        if same_version and still_lspatch:
+            self._prompt_uninstall_before_repatch(
+                e.serial, pkg, current_version,
+            )
+            return
+
         # Reuse the existing drift-recovery path. It already does
         # online-check → pull → patch → install → record version.
         self._trigger_repatch(e.serial)
+
+    def _read_tiktok_version_on_device(
+        self, serial: str, package: str,
+    ) -> str:
+        """Query ``dumpsys package`` for the live ``versionName``.
+
+        Returns an empty string if the package is missing or the
+        adb call fails — callers must treat empty as "unknown" and
+        fall through to the normal Re-Patch flow rather than block."""
+        try:
+            out = self.app.adb.shell(
+                f"dumpsys package {package} | grep -m1 versionName",
+                serial=serial, timeout=5,
+            )
+        except Exception:
+            log.exception("read_tiktok_version_on_device failed")
+            return ""
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("versionName="):
+                return line[len("versionName="):].split()[0]
+        return ""
+
+    def _prompt_uninstall_before_repatch(
+        self, serial: str, package: str, version: str,
+    ) -> None:
+        """Tell the customer why Re-Patch alone won't help on this
+        device, then offer to uninstall TikTok so Play Store will
+        accept the official build on next install attempt."""
+        msg = (
+            f"TikTok บนเครื่องนี้ยังเป็นเวอร์ชันเดิม ({version}) "
+            "— เท่ากับตอนที่ patch ครั้งล่าสุด\n\n"
+            "แปลว่า Play Store ปฏิเสธการอัปเดต "
+            "เพราะ TikTok ที่ติดตั้งอยู่มี signature ของ LSPatch "
+            "ไม่ตรงกับของ TikTok ทางการ\n\n"
+            "ทางแก้: ต้อง \"ถอน TikTok\" ออกก่อน "
+            "Play Store ถึงจะยอมให้ติดตั้งเวอร์ชันใหม่ได้\n\n"
+            "กด \"ตกลง\" เพื่อให้ระบบถอน TikTok ออกตอนนี้\n"
+            "หลังถอนเสร็จ:\n"
+            "  ① เปิด Play Store บนมือถือ → ค้นหา TikTok → ติดตั้ง\n"
+            "  ② อย่าเพิ่งเปิด TikTok / ไม่ต้อง login\n"
+            "  ③ กลับมาที่หน้านี้ กดปุ่มนี้อีกครั้ง"
+        )
+        if not messagebox.askokcancel(
+            "⚠️ ต้องถอน TikTok ก่อนอัปเดต", msg,
+        ):
+            return
+        threading.Thread(
+            target=self._uninstall_tiktok_worker,
+            args=(serial, package),
+            daemon=True,
+        ).start()
+
+    def _uninstall_tiktok_worker(
+        self, serial: str, package: str,
+    ) -> None:
+        """Background-thread `adb uninstall`. Bounces the result
+        back to the Tk thread via ``self.after`` because messagebox
+        from a worker thread can deadlock on macOS."""
+        cmd = [self.app.adb.adb_path, "-s", serial, "uninstall", package]
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=30, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self.after(0, lambda: messagebox.showerror(
+                "ถอน TikTok ไม่สำเร็จ",
+                "adb uninstall ใช้เวลานานเกินไป — "
+                "ลองถอด/เสียบสาย USB แล้วลองใหม่",
+            ))
+            return
+        except Exception as exc:
+            self.after(0, lambda x=exc: messagebox.showerror(
+                "ถอน TikTok ไม่สำเร็จ", f"เกิดข้อผิดพลาด: {x}",
+            ))
+            return
+        ok = "success" in (r.stdout or "").lower()
+        if ok:
+            self.after(0, lambda: messagebox.showinfo(
+                "ถอน TikTok สำเร็จ ✅",
+                "ขั้นตอนถัดไปบนมือถือ:\n"
+                "  ① เปิด Play Store → ค้นหา \"TikTok\" → ติดตั้ง\n"
+                "  ② รอจนติดตั้งเสร็จ (อย่าเพิ่งเปิดแอป)\n"
+                "  ③ กลับมาที่หน้านี้ กดปุ่ม "
+                "\"🆙 TikTok บังคับ update...\" อีกครั้ง",
+            ))
+        else:
+            err = (r.stderr or r.stdout or "").strip() or "ไม่ทราบสาเหตุ"
+            self.after(0, lambda m=err: messagebox.showerror(
+                "ถอน TikTok ไม่สำเร็จ",
+                f"adb uninstall ตอบกลับ:\n{m}",
+            ))
 
     def _on_patch_tiktok(self) -> None:
         e = self.app.selected_entry()
