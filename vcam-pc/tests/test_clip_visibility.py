@@ -57,11 +57,17 @@ def _pipeline_with_fake_adb(monkeypatch, adb_path: str = "/fake/adb"):
     return pipe
 
 
-def test_show_clip_broadcasts_mode_2_no_reload(monkeypatch):
-    """``show=True`` must broadcast SET_MODE with mode=2 and
-    omit forceReload — the file on disk hasn't changed since
-    the last push, and rebuilding MediaPlayer adds a visible
-    gap on the live feed for a no-op toggle."""
+def test_show_clip_broadcasts_mode_2_with_reload_and_touches_flag(monkeypatch):
+    """``show=True`` must (a) broadcast SET_MODE mode=2 WITH
+    ``forceReload=true`` so MediaPlayer restarts from frame 0, and
+    (b) touch the sentinel flag so ``CameraHook.resolvedMode()``
+    can't fall back to 0 if the broadcast receiver missed it.
+
+    The initial v1.8.15 attempt sent only the broadcast and skipped
+    forceReload to "avoid a visible gap on the live feed" — that
+    broke realtime feedback because MediaPlayer would resume from
+    its background position, often desynced from the audio that
+    the receiver restarts fresh on every Show."""
     rec = _RunRecorder()
     monkeypatch.setattr("src.hook_mode.subprocess.run", rec)
 
@@ -70,26 +76,39 @@ def test_show_clip_broadcasts_mode_2_no_reload(monkeypatch):
         show=True, serial="ABC123", tiktok_pkg="com.zhiliaoapp.musically",
     )
 
-    assert len(rec.calls) == 1, "exactly one adb invocation expected"
-    cmd = rec.calls[0]
-    assert cmd[0] == "/fake/adb"
-    assert cmd[1:3] == ["-s", "ABC123"]
-    assert "broadcast" in cmd
-    assert "-a" in cmd and "com.livemobillrerun.vcam.SET_MODE" in cmd
-    assert "-p" in cmd and "com.zhiliaoapp.musically" in cmd
-    # mode extra
-    mi = cmd.index("--ei")
-    assert cmd[mi + 1] == "mode" and cmd[mi + 2] == "2"
-    # forceReload must NOT be present for cheap toggles
-    assert "forceReload" not in cmd
+    # Two calls: broadcast, then sentinel touch.
+    assert len(rec.calls) == 2, (
+        f"expected broadcast + sentinel-touch; got {len(rec.calls)} calls"
+    )
+
+    broadcast = rec.calls[0]
+    assert broadcast[0] == "/fake/adb"
+    assert broadcast[1:3] == ["-s", "ABC123"]
+    assert "broadcast" in broadcast
+    assert "com.livemobillrerun.vcam.SET_MODE" in broadcast
+    assert "com.zhiliaoapp.musically" in broadcast
+    mi = broadcast.index("--ei")
+    assert broadcast[mi + 1] == "mode" and broadcast[mi + 2] == "2"
+    assert "forceReload" in broadcast, (
+        "Show must include forceReload=true so MediaPlayer rebuilds "
+        "from disk — otherwise the customer sees a stale frame "
+        "wherever the background-looping player happened to be"
+    )
+
+    sentinel = rec.calls[1]
+    assert "touch" in sentinel
+    assert "/data/local/tmp/vcam_enabled" in sentinel
 
 
-def test_hide_clip_broadcasts_mode_0(monkeypatch):
-    """``show=False`` must broadcast SET_MODE with mode=0 so the
-    LSPatched receiver flips to passthrough (real camera back).
-    Sentinel-file removal is intentionally NOT done here —
-    broadcast-only is the v1.8.15 design (see CLAUDE.md update
-    on clip visibility)."""
+def test_hide_clip_broadcasts_mode_0_and_removes_flag(monkeypatch):
+    """``show=False`` must (a) broadcast SET_MODE mode=0 AND (b)
+    delete the sentinel flag.
+
+    Without the rm, ``CameraHook.resolvedMode()`` (see Android
+    side at CameraHook.kt:230) returns 2 whenever the flag file
+    exists, even after the broadcast sets ``currentMode=0`` — so
+    Hide silently no-ops. That was the v1.8.15 "ไม่ realtime"
+    bug; this test pins the fix in place."""
     rec = _RunRecorder()
     monkeypatch.setattr("src.hook_mode.subprocess.run", rec)
 
@@ -98,13 +117,20 @@ def test_hide_clip_broadcasts_mode_0(monkeypatch):
         show=False, serial="ABC123", tiktok_pkg="com.zhiliaoapp.musically",
     )
 
-    assert len(rec.calls) == 1
-    cmd = rec.calls[0]
-    mi = cmd.index("--ei")
-    assert cmd[mi + 1] == "mode" and cmd[mi + 2] == "0", (
+    assert len(rec.calls) == 2
+
+    broadcast = rec.calls[0]
+    mi = broadcast.index("--ei")
+    assert broadcast[mi + 1] == "mode" and broadcast[mi + 2] == "0", (
         "hide must use mode=0 (passthrough), not 2"
     )
-    assert "forceReload" not in cmd
+    # forceReload is omitted for Hide — there's nothing on the
+    # passthrough side to reload.
+    assert "forceReload" not in broadcast
+
+    sentinel = rec.calls[1]
+    assert "rm" in sentinel
+    assert "/data/local/tmp/vcam_enabled" in sentinel
 
 
 def test_force_reload_still_default_for_push_completion(monkeypatch):

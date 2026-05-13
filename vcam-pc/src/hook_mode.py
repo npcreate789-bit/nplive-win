@@ -1007,22 +1007,55 @@ class HookModePipeline:
         without re-pushing the MP4.
 
         ``show=True`` switches the hook to mode 2 (replace camera with
-        the most recently-pushed clip). ``show=False`` switches to
-        mode 0 (passthrough — TikTok sees the real camera again). The
-        file on disk is left in place either way, so toggling back to
-        ``show=True`` resumes playback from the same source without
-        another `adb push`.
+        the most recently-pushed clip) AND restarts MediaPlayer from
+        the beginning so the customer sees frame 0 the moment they tap.
+        ``show=False`` switches to mode 0 (passthrough — TikTok sees
+        the real camera again). The MP4 on disk is left in place
+        either way, so toggling back is free of the encode + push
+        round-trip.
 
-        We pass ``force_reload=False`` for both toggles: the underlying
-        file hasn't changed, and rebuilding MediaPlayer adds a visible
-        gap on the live feed.
+        Why both broadcast AND sentinel file
+        ------------------------------------
+        Initial v1.8.15 fired only the broadcast, which silently
+        failed: ``CameraHook.resolvedMode()`` falls back to checking
+        ``/data/local/tmp/vcam_enabled`` whenever ``currentMode`` is
+        ``0``. The wizard / patch flow can leave that file in place,
+        so sending mode 0 alone left the hook still resolving mode 2
+        and the clip kept showing. Toggling the sentinel in lock-step
+        with the broadcast is what makes Hide actually take effect.
+
+        Why ``force_reload=True`` on Show
+        ---------------------------------
+        While hidden, MediaPlayer keeps looping in the background (the
+        receiver only stops AudioFeeder, not VideoFeeder). Without
+        reload, the next Show would resume from whatever frame the
+        player happened to reach — visually jarring and tends to
+        desync with the audio that we DO restart fresh on Show. The
+        reload costs one MediaPlayer rebuild (~50–100 ms) which is
+        invisible to the customer compared to the 1–2 s "is it
+        actually showing?" wait the initial broadcast-only path had.
         """
         self._broadcast_force_reload(
             serial=serial,
             tiktok_pkg=tiktok_pkg,
             mode=2 if show else 0,
-            force_reload=False,
+            force_reload=show,
         )
+        # Belt-and-suspenders: bring the sentinel file in line with
+        # the broadcast so ``resolvedMode()`` can't override us. This
+        # also makes the state survive a TikTok cold start (the
+        # broadcast receiver only exists while the process is alive;
+        # the flag file is read every frame).
+        try:
+            self.set_enabled(show, serial=serial)
+        except Exception:
+            # set_enabled is best-effort — the broadcast already
+            # delivered the toggle, and a missed sentinel write just
+            # leaves the previous flag state which the broadcast
+            # will continue to override for as long as TikTok stays
+            # running.
+            log.debug("set_clip_visibility: sentinel update failed",
+                      exc_info=True)
 
     def broadcast_flip_transform_to_tiktok(
         self,
