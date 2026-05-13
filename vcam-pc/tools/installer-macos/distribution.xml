@@ -26,18 +26,37 @@
     <domains enable_localSystem="true"/>
 
     <!-- Visual customisation: dark-red branded background. The same
-         PNG renders in both light + dark Aqua modes. -->
+         PNG renders in both light + dark Aqua modes.
+
+         v1.8.14 stability fix: switched ``scaling="proportional"``
+         → ``scaling="tofit"``. ``proportional`` caused some customer
+         machines (notably 1366×768 laptops with Display Scaling on)
+         to compute a non-standard window height where the
+         Installer.app's bottom navigation chrome (Go Back / Continue
+         buttons) ended up clipped below the visible area. ``tofit``
+         is what Apple's own .pkg installers use — it keeps the
+         left-pane image scaled within its 620×418 frame without
+         ever influencing the overall window height. -->
     <background file="background.png"
                 alignment="bottomleft"
-                scaling="proportional"
+                scaling="tofit"
                 mime-type="image/png"/>
     <background-darkAqua file="background.png"
                           alignment="bottomleft"
-                          scaling="proportional"
+                          scaling="tofit"
                           mime-type="image/png"/>
-    <welcome file="welcome.html" mime-type="text/html"/>
+    <!-- v1.8.14 stability fix: welcome + conclusion moved
+         HTML → RTF. macOS Installer.app's WebKit-backed HTML
+         renderer has long-standing quirks where content height
+         calculations can push the window chrome off-screen on
+         non-default DPI / accessibility configurations, hiding
+         the Go Back / Continue buttons. RTF uses native AppKit
+         text rendering (the same path Apple's own installers
+         take) so the layout is deterministic across every macOS
+         version we support. -->
+    <welcome file="welcome.rtf" mime-type="application/rtf"/>
     <license file="license.txt" mime-type="text/plain"/>
-    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <conclusion file="conclusion.rtf" mime-type="application/rtf"/>
 
     <!-- Minimum macOS = Big Sur (11.0). Covers Apple Silicon and
          every Intel Mac still receiving Apple security updates. -->
@@ -47,8 +66,12 @@
         </allowed-os-versions>
     </volume-check>
 
-    <!-- No checkbox UI; the single component is required. -->
-    <options customize="never" allow-external-scripts="no" rootVolumeOnly="false" require-scripts="false"/>
+    <!-- No checkbox UI; the single component is required.
+         ``rootVolumeOnly="true"`` removes the volume picker so the
+         installer never adds the extra "Destination Select" pane —
+         one fewer screen means one fewer place the bottom button
+         row can be pushed off the customer's display. -->
+    <options customize="never" allow-external-scripts="no" rootVolumeOnly="true" require-scripts="false"/>
 
     <choices-outline>
         <line choice="default">

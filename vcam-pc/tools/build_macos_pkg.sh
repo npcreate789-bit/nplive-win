@@ -183,7 +183,9 @@ sed \
     "$DIST_XML_SRC" > "$DIST_XML"
 
 # Copy Resources/ into the staging tree so productbuild can pick
-# up welcome.html / license.txt / conclusion.html / background.png.
+# up welcome.rtf / license.txt / conclusion.rtf / background.png.
+# (welcome/conclusion switched HTML → RTF in v1.8.14 to dodge
+# Installer.app's WebKit layout quirks — see distribution.xml.)
 RES_STAGING="$STAGING/resources"
 mkdir -p "$RES_STAGING"
 cp -R "$RES_SRC"/* "$RES_STAGING/"
