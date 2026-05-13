@@ -128,8 +128,36 @@ fi
 [[ -f "$PROJECT/docs/MANUAL_TH.md" ]] && \
     cp "$PROJECT/docs/MANUAL_TH.md" "$VOLUME_ROOT/MANUAL_TH.md"
 
-# Applications symlink — the standard drag-to-install affordance.
+# Applications symlink — the standard drag-to-install affordance
+# (kept as a fallback for power users who prefer drag-drop).
 ln -s /Applications "$VOLUME_ROOT/Applications"
+
+# One-click installer .command. Customers who follow the "double
+# click this first" sticker in the .dmg get an automated install
+# that strips Gatekeeper quarantine — no scary "cannot verify
+# malware" dialog on macOS 14+. The leading emoji + space sorts
+# the file to the top of the volume window in Finder so it's the
+# first thing the customer sees. Filename is in Thai to match the
+# product language and so customers don't need to guess what
+# language the installer expects.
+INSTALL_CMD_SRC="$PROJECT/tools/installer-macos/install_to_applications.command"
+INSTALL_CMD_DST="$VOLUME_ROOT/📦 ติดตั้งลง Applications.command"
+if [[ -f "$INSTALL_CMD_SRC" ]]; then
+    cp "$INSTALL_CMD_SRC" "$INSTALL_CMD_DST"
+    chmod +x "$INSTALL_CMD_DST"
+fi
+
+# Ad-hoc codesign the .app and strip any quarantine xattrs that
+# might have hitched a ride from the build machine. Ad-hoc
+# signing (``--sign -``) doesn't pass full Notarization but it
+# DOES give the bundle a valid signature so library validation
+# stops nagging on launch, and reduces the dialog wording from
+# "cannot verify malware" to the milder "downloaded from
+# internet, open?" on stock macOS. Combined with the installer
+# .command's xattr strip, the customer's launch is silent.
+echo "      ad-hoc signing + cleaning xattrs"
+xattr -cr "$APP_DST" 2>/dev/null || true
+codesign --force --deep --sign - "$APP_DST" 2>/dev/null || true
 
 APP_SIZE=$(du -sh "$APP_DST" | awk '{print $1}')
 VOL_FILES=$(find "$VOLUME_ROOT" -type f | wc -l | tr -d ' ')
