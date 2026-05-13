@@ -142,6 +142,15 @@ class DeviceEntry:
     # that sort by "newest" don't get confused by NULL values.
     created_at: str = ""
 
+    # Whether the most recently pushed clip is currently visible on
+    # the phone (vcam mode 2). Toggled by the Show/Hide button that
+    # appears under the Encode+Push card after a successful push.
+    # Default ``True`` matches the historical behaviour where every
+    # push immediately starts displaying. The phone-side state is the
+    # broadcast we last fired; this field is the PC's mirror so the
+    # button label survives an app restart.
+    clip_showing: bool = True
+
     def display_name(self) -> str:
         return self.label or self.model or self.serial
 
@@ -240,6 +249,7 @@ class DeviceLibrary:
                     transport=str(raw.get("transport", "usb") or "usb"),
                     vcam_app_key=str(raw.get("vcam_app_key", "")),
                     created_at=str(raw.get("created_at", "")),
+                    clip_showing=bool(raw.get("clip_showing", True)),
                 )
             except Exception:
                 log.exception("skipping malformed device entry %r", serial)
@@ -309,6 +319,17 @@ class DeviceLibrary:
             e = self.entries.get(serial)
             if e is not None:
                 e.last_audio = audio_path
+
+    def set_clip_showing(self, serial: str, showing: bool) -> None:
+        """Mirror the broadcast we last fired at the phone so the
+        Show/Hide toggle in the encode card remembers its label
+        across app restarts. No-op if the device isn't in the
+        library yet (the Show button can't be visible without a
+        prior successful push, which would have upserted the entry)."""
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is not None:
+                e.clip_showing = bool(showing)
 
     def update_transform(
         self,

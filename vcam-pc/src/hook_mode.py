@@ -950,14 +950,29 @@ class HookModePipeline:
         serial: str | None = None,
         tiktok_pkg: str = TIKTOK_PACKAGE_DEFAULT,
         audio_reload: bool = False,
+        mode: int = 2,
+        force_reload: bool = True,
     ) -> None:
-        """Fire ``com.livemobillrerun.vcam.SET_MODE forceReload=true`` at
-        the running TikTok process so the in-process receiver inside
-        the LSPatched APK rebuilds MediaPlayer with the freshly-pushed
-        MP4. We deliberately use ``-p <tiktok_pkg>`` (package filter)
+        """Fire ``com.livemobillrerun.vcam.SET_MODE`` at the running
+        TikTok process so the in-process receiver inside the LSPatched
+        APK applies a new mode (and optionally rebuilds MediaPlayer).
+
+        We deliberately use ``-p <tiktok_pkg>`` (package filter)
         instead of ``-n component``, because the receiver is registered
         at runtime by the hook (no manifest entry to target).
 
+        Parameters
+        ----------
+        mode
+            VCam mode: ``2`` = replace camera with pushed clip (default,
+            preserves historical post-push behaviour), ``0`` = passthrough
+            (let TikTok see the real camera again — i.e. "hide clip").
+        force_reload
+            When ``True``, asks the hook to tear down and rebuild
+            MediaPlayer from the file on disk. Required after a fresh
+            ``push_to_phone()`` so stale frames aren't shown. Set to
+            ``False`` for cheap mode toggles where the file hasn't
+            changed.
         ``audio_reload`` adds an ``--ez audioReload true`` extra so
         the AudioFeeder picks up a freshly-pushed override file.
         """
@@ -969,9 +984,10 @@ class HookModePipeline:
             "shell", "am", "broadcast",
             "-a", "com.livemobillrerun.vcam.SET_MODE",
             "-p", tiktok_pkg,
-            "--ei", "mode", "2",
-            "--ez", "forceReload", "true",
+            "--ei", "mode", str(int(mode)),
         ]
+        if force_reload:
+            cmd += ["--ez", "forceReload", "true"]
         if audio_reload:
             cmd += ["--ez", "audioReload", "true"]
         try:
@@ -979,6 +995,34 @@ class HookModePipeline:
                            timeout=5, check=False)
         except subprocess.TimeoutExpired:
             log.debug("force-reload broadcast timed out (harmless)")
+
+    def set_clip_visibility(
+        self,
+        *,
+        show: bool,
+        serial: str | None = None,
+        tiktok_pkg: str = TIKTOK_PACKAGE_DEFAULT,
+    ) -> None:
+        """Show or hide the pushed clip on the patched TikTok process
+        without re-pushing the MP4.
+
+        ``show=True`` switches the hook to mode 2 (replace camera with
+        the most recently-pushed clip). ``show=False`` switches to
+        mode 0 (passthrough — TikTok sees the real camera again). The
+        file on disk is left in place either way, so toggling back to
+        ``show=True`` resumes playback from the same source without
+        another `adb push`.
+
+        We pass ``force_reload=False`` for both toggles: the underlying
+        file hasn't changed, and rebuilding MediaPlayer adds a visible
+        gap on the live feed.
+        """
+        self._broadcast_force_reload(
+            serial=serial,
+            tiktok_pkg=tiktok_pkg,
+            mode=2 if show else 0,
+            force_reload=False,
+        )
 
     def broadcast_flip_transform_to_tiktok(
         self,

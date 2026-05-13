@@ -1039,8 +1039,22 @@ class DashboardPage(ctk.CTkFrame):
 
         self.lbl_encode_status = _muted(vid, "พร้อม")
         self.lbl_encode_status.grid(
-            row=7, column=0, sticky="w", padx=20, pady=(0, 16),
+            row=7, column=0, sticky="w", padx=20, pady=(0, 4),
         )
+
+        # Show / Hide toggle for the most recent clip. Hidden until
+        # a successful push completes (see _render_encode_card_for);
+        # tap to flip vcam mode between 2 (replace) and 0 (passthrough)
+        # without re-encoding or re-pushing the file.
+        self.btn_clip_visibility = _ghost_button(
+            vid, "⏸  หยุดแสดงคลิป",
+            command=self._on_toggle_clip_visibility,
+            width=200,
+        )
+        self.btn_clip_visibility.grid(
+            row=8, column=0, sticky="w", padx=20, pady=(4, 16),
+        )
+        self.btn_clip_visibility.grid_remove()
 
         # Rotation card
         rot = _card(main)
@@ -3921,6 +3935,21 @@ class DashboardPage(ctk.CTkFrame):
             log.debug("sidebar badge refresh during encode-update failed",
                       exc_info=True)
 
+        # A successful push fires ``forceReload=true mode=2`` at the
+        # phone, which always restarts the clip in "showing" state.
+        # Mirror that on the DeviceEntry so the toggle button label
+        # reads "หยุดแสดงคลิป" the first time it appears (and after
+        # the next app restart). Errors / cancels leave the prior
+        # flag alone — what's actually playing on the phone hasn't
+        # changed in those cases.
+        if task.state == STATE_DONE:
+            try:
+                self.app.devices_lib.set_clip_showing(task.serial, True)
+                self.app.devices_lib.save()
+            except Exception:
+                log.debug("clip_showing persist after push failed",
+                          exc_info=True)
+
         if self.app.selected_serial == task.serial:
             self._render_encode_card_for(task)
 
@@ -3947,6 +3976,13 @@ class DashboardPage(ctk.CTkFrame):
         the card for whichever task that device has (or the
         pristine state if no task has run yet).
         """
+        # Hide the Show/Hide toggle by default; the DONE branch puts
+        # it back via _refresh_clip_visibility_btn. Re-encoding /
+        # re-pushing invalidates the old "clip on device" assumption
+        # the toggle is built around, so it has to disappear while
+        # those transient states are in flight.
+        if hasattr(self, "btn_clip_visibility"):
+            self.btn_clip_visibility.grid_remove()
         if task.state == STATE_QUEUED:
             self.btn_encode_push.configure(
                 state="disabled", text="กำลังเตรียม…",
@@ -3975,6 +4011,7 @@ class DashboardPage(ctk.CTkFrame):
             self.lbl_encode_status.configure(
                 text=task.message, text_color=THEME.success,
             )
+            self._refresh_clip_visibility_btn()
             return
         if task.state == STATE_ERROR:
             self.btn_encode_push.configure(
@@ -4008,6 +4045,73 @@ class DashboardPage(ctk.CTkFrame):
         self.lbl_encode_status.configure(
             text="พร้อม", text_color=THEME.fg_muted,
         )
+        if hasattr(self, "btn_clip_visibility"):
+            self.btn_clip_visibility.grid_remove()
+
+    def _refresh_clip_visibility_btn(self) -> None:
+        """Show the toggle button under the encode card and sync its
+        label to the selected device's ``clip_showing`` flag.
+
+        Called from the ``STATE_DONE`` branch of
+        ``_render_encode_card_for`` and from the toggle handler
+        itself. Safe to call before the widget exists (no-op).
+        """
+        if not hasattr(self, "btn_clip_visibility"):
+            return
+        e = self.app.selected_entry()
+        if e is None:
+            self.btn_clip_visibility.grid_remove()
+            return
+        self.btn_clip_visibility.grid()
+        if e.clip_showing:
+            self.btn_clip_visibility.configure(
+                text="⏸  หยุดแสดงคลิป",
+                text_color=THEME.warning,
+            )
+        else:
+            self.btn_clip_visibility.configure(
+                text="▶  แสดงคลิป",
+                text_color=THEME.success,
+            )
+
+    def _on_toggle_clip_visibility(self) -> None:
+        """Flip the on-phone vcam mode without re-pushing the clip.
+
+        ``clip_showing`` mirrors the broadcast we last fired. Toggling
+        it sends ``com.livemobillrerun.vcam.SET_MODE`` with mode 0
+        (passthrough) or 2 (replace) so the LSPatched TikTok process
+        starts or stops surfacing the most recently pushed MP4.
+
+        We persist the new state on ``DeviceEntry`` so the button
+        label survives an app restart; the file on disk is left
+        untouched so the next toggle in either direction is free.
+        """
+        e = self.app.selected_entry()
+        if e is None:
+            return
+        new_state = not e.clip_showing
+        adb_id = self.app.adb_id_for(e)
+        from ..hook_mode import TIKTOK_PACKAGE_DEFAULT
+        pkg = e.tiktok_package or TIKTOK_PACKAGE_DEFAULT
+        try:
+            self.app.hook.set_clip_visibility(
+                show=new_state,
+                serial=adb_id,
+                tiktok_pkg=pkg,
+            )
+        except Exception:
+            log.exception("set_clip_visibility failed")
+            messagebox.showerror(
+                "เปลี่ยนสถานะคลิปไม่สำเร็จ",
+                "ส่งคำสั่งไปยังเครื่องไม่ได้ — ตรวจสายเชื่อมต่อแล้วลองใหม่",
+            )
+            return
+        self.app.devices_lib.set_clip_showing(e.serial, new_state)
+        try:
+            self.app.devices_lib.save()
+        except Exception:
+            log.exception("devices_lib.save after clip toggle failed")
+        self._refresh_clip_visibility_btn()
 
     def _show_encode_modal(self, task: EncodePushTask) -> None:
         """Modal nudge for terminal-state task on the visible device.
