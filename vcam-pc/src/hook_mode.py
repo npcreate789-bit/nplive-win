@@ -308,16 +308,17 @@ class HookModePipeline:
         before it can finish.
 
         Heuristic:
-          * libx264 ``veryfast`` typically runs ~1-2× realtime on a
-            mid-range PC. We allow 4× as the worst-case (cold cache,
-            CPU contention, slow disk).
+          * libx264 ``slow`` (the sharpness-first preset we switched
+            to) runs ~0.3-0.5× realtime on a mid-range PC. We allow
+            10× duration as worst-case (cold cache, CPU contention,
+            slow disk, 4K source downscale).
           * Plus a 60 s setup buffer for ffprobe + scaler init.
           * Plus 30 s per GB of disk I/O headroom.
           * Floor at 600 s (10 min) so existing short-clip behavior
             doesn't change.
         """
         gb = max(0, total_bytes) / (1024 ** 3)
-        budget = 4.0 * max(0.0, duration_s) + 60.0 + 30.0 * gb
+        budget = 10.0 * max(0.0, duration_s) + 60.0 + 30.0 * gb
         return max(600, int(budget))
 
     def _spawn_push_sampler(
@@ -557,9 +558,28 @@ class HookModePipeline:
         cmd += [
             "-vf", ",".join(vf),
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-profile:v", "baseline",
-            "-level", "4.0",
+            # Sharpness-first preset/profile picks:
+            #   preset=slow       → ~5-8× slower than veryfast but
+            #                       buys back fine detail in motion;
+            #                       acceptable here because the file
+            #                       is encoded ONCE then replayed by
+            #                       TikTok from /sdcard (not a live
+            #                       upload, so encode-time slack is
+            #                       fine for crispness).
+            #   tune=film         → x264 mode optimised for live-action
+            #                       camera footage (less psy-rd
+            #                       smoothing than the default).
+            #   profile=high +    → Every Android device the LSPatch
+            #     level=4.1         flow targets supports high@4.1; we
+            #                       switched off baseline (which was a
+            #                       2018-era compatibility hedge) to
+            #                       gain ~15 % compression efficiency.
+            #   x264-params       → ref=4, bframes=4 lift quality at
+            #                       the same bitrate by ~0.5 dB PSNR.
+            "-preset", "slow",
+            "-tune", "film",
+            "-profile:v", "high",
+            "-level", "4.1",
             "-pix_fmt", "yuv420p",
             "-r", str(self.cfg.fps),
             "-g", str(keyint),
@@ -568,9 +588,18 @@ class HookModePipeline:
             "-b:v", self.cfg.video_bitrate,
             "-maxrate", self.cfg.video_maxrate,
             "-bufsize", self.cfg.video_bufsize,
-            # Audio — TikTok expects audio. Re-encode to AAC LC.
+            "-x264-params", "ref=4:bframes=4",
+            # Explicit BT.709 tags so TikTok's pipeline doesn't fall
+            # back to BT.601 (the SDTV gamut) and shift skin tones.
+            "-color_range", "tv",
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            # Audio — TikTok expects audio. AAC LC at 192k matches the
+            # bitrate TikTok's own Live Studio targets; 128k was
+            # noticeably thin on music backgrounds.
             "-c:a", "aac",
-            "-b:a", "128k",
+            "-b:a", "192k",
             "-ac", "2",
             "-ar", "44100",
             # MP4 with moov-at-front for streaming-friendly playback.

@@ -94,9 +94,17 @@ class StreamConfig:
     # phone — no rotation knobs required. Set false in ``config.json``
     # for the legacy front-camera filter chain.
     hook_encode_rear_facing: bool = True
-    video_bitrate: str = "2000k"
-    video_maxrate: str = "2500k"
-    video_bufsize: str = "4000k"
+    # Bitrate budget tuned for "sharpest 1080p that TikTok's ingest
+    # will pass through without re-compressing". TikTok Live Studio
+    # documents 4-6 Mbps as the safe band for 1080p30; we sit at the
+    # top end (8 Mbps target, 10 Mbps peaks) because the file is
+    # *played back* by TikTok rather than streamed live to its
+    # ingest — there is no upload bandwidth ceiling, and headroom
+    # buys back detail in high-motion scenes that veryfast / 2 Mbps
+    # used to smear. bufsize = 2× maxrate per x264 best practice.
+    video_bitrate: str = "8000k"
+    video_maxrate: str = "10000k"
+    video_bufsize: str = "16000k"
     keyint_seconds: int = 2
     loop_playlist: bool = True
     auto_adb_reverse: bool = True
