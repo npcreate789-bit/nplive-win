@@ -507,11 +507,28 @@ class HookModePipeline:
         """
         ffmpeg = self._resolve_ffmpeg()
         if ffmpeg is None:
+            from .platform_tools import current_os
+            os_name = current_os()
+            if os_name == "windows":
+                hint = (
+                    "ติดตั้ง NP Create ใหม่จาก Setup ล่าสุด "
+                    "(.tools\\windows\\ffmpeg.exe ควรมาพร้อมตัวติดตั้ง)\n"
+                    "หรือดาวน์โหลด ffmpeg.exe เองแล้ววางที่ "
+                    "%LOCALAPPDATA%\\NP Create\\.tools\\windows\\ffmpeg.exe"
+                )
+            elif os_name == "macos":
+                hint = (
+                    "ลองรัน: python3 tools/setup_ffmpeg.py\n"
+                    "หรือลง ffmpeg เพิ่มเอง (brew install ffmpeg)"
+                )
+            else:
+                hint = (
+                    "ลองรัน: python3 tools/setup_ffmpeg.py\n"
+                    "หรือลง ffmpeg ผ่าน package manager ของระบบ"
+                )
             return HookEncodeResult(
                 False, output_path, 0.0, 0,
-                "ffmpeg ไม่พบในระบบ\n"
-                "ลองรัน: python3 tools/setup_ffmpeg.py\n"
-                "หรือลง ffmpeg เพิ่มเอง (brew install ffmpeg)",
+                "ffmpeg ไม่พบในระบบ\n" + hint,
             )
 
         # Output is landscape — that matches the Camera2 surface

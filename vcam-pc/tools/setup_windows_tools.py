@@ -146,6 +146,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 3
 
+    # ── ffmpeg.exe (delegate to setup_ffmpeg.py) ────────────────
+    # Without this, the installed app raises "ffmpeg ไม่พบในระบบ"
+    # the first time the customer hits Encode. setup_ffmpeg.py
+    # owns the pinned upstream URL + extract logic for all OSes;
+    # we just invoke its windows path here so a single
+    # setup_windows_tools.py run leaves .tools/windows/ complete.
+    ffmpeg_exe = WIN_TOOLS / "ffmpeg.exe"
+    if ffmpeg_exe.is_file() and not args.force:
+        size_mb = ffmpeg_exe.stat().st_size / 1024 / 1024
+        print(f"  ✓ ffmpeg.exe already at {ffmpeg_exe} ({size_mb:,.1f} MB)")
+    else:
+        from setup_ffmpeg import install_one as _install_ffmpeg
+        _install_ffmpeg("windows", force=args.force)
+
     # ── verify ──────────────────────────────────────────────────
     print()
     print("Verification:")
@@ -155,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         ("java.exe   ", java_exe),
         ("adb.exe    ", adb_exe),
         ("lspatch.jar", dst_jar),
+        ("ffmpeg.exe ", ffmpeg_exe),
     ]:
         mark = "✓" if path.is_file() else "✗"
         print(f"  {mark} {label} {path}")
