@@ -21,13 +21,16 @@ when the customer double-clicks ``NP-Create.exe`` / ``NP-Create.app``:
 
 from __future__ import annotations
 
+import importlib.abc
+import importlib.machinery
+import importlib.util
 import os
 import re
 import shutil
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 
 # Overlay layout has to match ``src.auto_update.overlay_root`` /
@@ -176,6 +179,100 @@ def _prepare_overlay_path() -> Optional[Path]:
     return overlay_src.parent
 
 
+class _OverlaySourceFinder(importlib.abc.MetaPathFinder):
+    """Override ``src.*`` lookups so patched files in the overlay
+    win over PyInstaller's PYZ-frozen modules.
+
+    Why a MetaPathFinder, not just ``sys.path``
+    -------------------------------------------
+    PyInstaller installs a ``FrozenImporter`` in ``sys.meta_path[0]``.
+    Every ``import src.X`` hits the FrozenImporter first; only
+    misses fall through to ``PathFinder`` (= ``sys.path`` lookup).
+    Since PyInstaller packs every ``src.*`` module into the PYZ at
+    build time, the FrozenImporter ALWAYS hits — adding the overlay
+    to ``sys.path`` did literally nothing.
+
+    The fix is a custom finder registered AHEAD of the FrozenImporter.
+    For each ``src.*`` request it looks up the corresponding
+    ``.py`` / ``__init__.py`` inside the overlay dir. A hit returns
+    a regular ``SourceFileLoader`` spec; a miss returns ``None`` so
+    Python continues down ``sys.meta_path`` and the FrozenImporter
+    still serves modules the overlay doesn't carry.
+
+    This means a partial patch (zip with only ``branding.py``) just
+    overrides ``src.branding`` and lets every other ``src.*`` come
+    from the PYZ. No double-load, no version skew within a single
+    module, and the overlay can be safely empty (initial state on
+    a brand-new install).
+    """
+
+    _PKG = "src"
+
+    def __init__(self, overlay_src: Path) -> None:
+        self.overlay_src = overlay_src
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: Optional[Sequence[str]] = None,
+        target: object = None,
+    ):
+        # Only intercept ``src`` and its subpackages.
+        if fullname != self._PKG and not fullname.startswith(self._PKG + "."):
+            return None
+
+        if fullname == self._PKG:
+            init = self.overlay_src / "__init__.py"
+            if not init.is_file():
+                return None
+            loader = importlib.machinery.SourceFileLoader(fullname, str(init))
+            spec = importlib.util.spec_from_file_location(
+                fullname,
+                str(init),
+                loader=loader,
+                submodule_search_locations=[str(self.overlay_src)],
+            )
+            return spec
+
+        # Strip the "src." prefix, walk the overlay tree.
+        rel = fullname[len(self._PKG) + 1:]
+        parts = rel.split(".")
+        pkg_init = self.overlay_src.joinpath(*parts, "__init__.py")
+        if pkg_init.is_file():
+            loader = importlib.machinery.SourceFileLoader(
+                fullname, str(pkg_init),
+            )
+            return importlib.util.spec_from_file_location(
+                fullname,
+                str(pkg_init),
+                loader=loader,
+                submodule_search_locations=[str(pkg_init.parent)],
+            )
+        py_file = self.overlay_src.joinpath(*parts).with_suffix(".py")
+        if py_file.is_file():
+            loader = importlib.machinery.SourceFileLoader(
+                fullname, str(py_file),
+            )
+            return importlib.util.spec_from_file_location(
+                fullname, str(py_file), loader=loader,
+            )
+        # Miss — fall through to the FrozenImporter so unpatched
+        # modules keep working.
+        return None
+
+
+def _install_overlay_finder(overlay_src: Path) -> None:
+    """Insert the OverlaySourceFinder at the head of ``sys.meta_path``
+    so it gets first crack at every ``src.*`` import. Idempotent: a
+    second call replaces the existing finder rather than stacking
+    duplicates.
+    """
+    sys.meta_path = [
+        f for f in sys.meta_path if not isinstance(f, _OverlaySourceFinder)
+    ]
+    sys.meta_path.insert(0, _OverlaySourceFinder(overlay_src))
+
+
 def _ensure_src_on_path() -> None:
     # When frozen, PyInstaller sets ``sys._MEIPASS`` to the temp
     # extraction dir. The ``src`` package was added via
@@ -189,18 +286,17 @@ def _ensure_src_on_path() -> None:
         sys.path.insert(0, base)
 
     # v1.8.17: prefer the persistent overlay copy of src/ over the
-    # one in _MEIPASS so auto-update patches actually take effect.
-    # Source mode skips this — ``_prepare_overlay_path`` returns
-    # None when ``sys._MEIPASS`` isn't set.
+    # PyInstaller PYZ-frozen modules. Two-step:
+    #   1. Seed / refresh the overlay dir (handled by
+    #      ``_prepare_overlay_path`` — copies _MEIPASS/src on first
+    #      launch or after the customer reinstalls a newer .exe).
+    #   2. Install a meta-path finder ahead of FrozenImporter so
+    #      ``import src.X`` finds the overlay's ``.py`` first.
     overlay_parent = _prepare_overlay_path()
     if overlay_parent is not None:
-        op = str(overlay_parent)
-        # Insert at position 0 so it sits AHEAD of MEIPASS (which
-        # was just inserted above at position 0; this push moves
-        # MEIPASS to position 1).
-        if op in sys.path:
-            sys.path.remove(op)
-        sys.path.insert(0, op)
+        overlay_src = overlay_parent / "src"
+        if overlay_src.is_dir():
+            _install_overlay_finder(overlay_src)
 
 
 def _show_fatal(text: str) -> None:

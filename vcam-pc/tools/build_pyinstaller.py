@@ -124,9 +124,33 @@ def _add_data_args() -> list[str]:
     assets = PROJECT / "assets"
     if assets.is_dir():
         items.append((assets, "assets"))
-    pubkey = PROJECT / "src" / "_pubkey.py"
-    if pubkey.is_file():
-        items.append((pubkey, "src"))
+    # v1.8.17: ship the full ``src/`` tree as data inside the bundle
+    # (not just ``_pubkey.py``). PyInstaller still packs every
+    # ``src.*`` module into the PYZ archive — that's how imports
+    # resolve at startup — but we ALSO need the raw ``.py`` files
+    # available on disk because:
+    #
+    # 1. ``_pyinstaller_entry.py`` seeds the persistent overlay
+    #    (``%LOCALAPPDATA%\NPCreate\src_overlay\src`` on Windows,
+    #    ``~/Library/Application Support/NPCreate/src_overlay/src``
+    #    on macOS) from ``_MEIPASS/src/`` on first launch. Without
+    #    source files in _MEIPASS, the overlay is empty and
+    #    ``auto_update.apply_patch`` would have nothing to swap.
+    # 2. The ``OverlaySourceFinder`` meta-path hook (also in the
+    #    entry stub) loads patched modules off disk via
+    #    ``SourceFileLoader`` so subsequent imports of e.g.
+    #    ``src.branding`` resolve to the patched copy, not the
+    #    PYZ-frozen one. The hook returns ``None`` for modules
+    #    that aren't present in the overlay, so unpatched files
+    #    keep loading from the PYZ — no double-load, no
+    #    inconsistency.
+    src_pkg = PROJECT / "src"
+    if src_pkg.is_dir():
+        items.append((src_pkg, "src"))
+    else:
+        pubkey = src_pkg / "_pubkey.py"
+        if pubkey.is_file():
+            items.append((pubkey, "src"))
     out: list[str] = []
     for src, dst in items:
         out.extend(["--add-data", f"{src}{sep}{dst}"])
