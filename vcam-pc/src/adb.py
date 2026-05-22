@@ -117,6 +117,28 @@ class AdbController:
             return False
         return r.returncode == 0
 
+    def kill_server(self) -> bool:
+        """``adb kill-server`` — tear down the daemon on port 5037.
+
+        Called on app shutdown so the ``adb.exe`` fork-server doesn't
+        linger in Task Manager after the dashboard window closes.
+        Best-effort: returns ``False`` (and logs) on any error, but
+        never raises — shutdown must not be blocked by a wedged adb.
+        """
+        if shutil.which(self.adb_path) is None:
+            return False
+        try:
+            r = self._run("kill-server", timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log.warning("adb kill-server failed: %s", e)
+            return False
+        if r.returncode != 0:
+            # Non-zero is expected when no daemon is running; log at
+            # debug only so a clean shutdown doesn't spam warnings.
+            log.debug("adb kill-server rc=%s err=%r",
+                      r.returncode, (r.stderr or "").strip())
+        return True
+
     def restart_server(self) -> bool:
         """``adb kill-server`` then ``adb start-server``.
 

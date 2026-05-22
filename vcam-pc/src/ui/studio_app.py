@@ -1352,6 +1352,16 @@ class StudioApp(ctk.CTk):
             scrcpy_mirror.stop_all()
         except Exception:
             log.exception("scrcpy mirror cleanup on shutdown failed")
+        # Kill the adb daemon (port 5037 fork-server). Without this
+        # the bundled ``adb.exe`` keeps running in Task Manager after
+        # the dashboard window closes — customers reported having to
+        # End Task it manually before relaunching, and on Windows the
+        # stale daemon also holds the USB handle so the next launch
+        # sees the phone as ``offline`` until the daemon dies.
+        try:
+            self.adb.kill_server()
+        except Exception:
+            log.exception("adb kill-server on shutdown failed")
         self.save_devices()
         # v1.8.13: if the customer enabled "ติดตั้งตอนปิดโปรแกรม"
         # AND the auto-update prefetcher already has the zip on

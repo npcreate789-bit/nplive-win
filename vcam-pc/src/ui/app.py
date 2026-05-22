@@ -989,6 +989,10 @@ class VcamApp(tk.Tk):
         try:
             self._on_stop()
         finally:
+            try:
+                self.adb.kill_server()
+            except Exception:
+                log.exception("adb kill-server on shutdown failed")
             self.destroy()
 
     # ── Hook Mode (Phase 4c) ───────────────────────────────────
