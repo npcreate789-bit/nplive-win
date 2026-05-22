@@ -101,6 +101,120 @@ MAX_PATCH_BYTES = 50 * 1024 * 1024   # 50 MB
 _STAGING_DIR_NAME = "npcreate_update_staging"
 
 
+# ── overlay src/ for frozen builds ──────────────────────────────
+#
+# Why this exists: a PyInstaller frozen build ships ``src/`` inside
+# ``sys._MEIPASS``, which the bootloader extracts to a fresh temp
+# dir on every launch and wipes when the app exits. Patching there
+# silently rolls back next launch. Worse, ``sys.executable`` is the
+# .exe itself, so the old ``[python, "-m", "src.main"]`` relaunch
+# spawned the launcher with ``-m`` as argv and argparse killed the
+# child before any window ever opened.
+#
+# The fix has two halves:
+#
+# 1. ``apply_patch`` writes into a **persistent** sibling of the
+#    user profile (``%LOCALAPPDATA%\NPCreate\src_overlay\src`` on
+#    Windows, ``~/Library/Application Support/NPCreate/src_overlay/src``
+#    on macOS) instead of the read-only / temp ``_MEIPASS`` copy.
+# 2. ``_pyinstaller_entry.py`` seeds the overlay from ``_MEIPASS`` on
+#    first launch and inserts it ahead of ``_MEIPASS`` on ``sys.path``
+#    so Python imports the patched copy.
+#
+# Source-mode runs (``python -m src.main``) ignore the overlay
+# entirely — they patch the live tree exactly as before.
+
+_OVERLAY_APP_NAME = "NPCreate"
+_OVERLAY_DIRNAME = "src_overlay"
+
+
+def is_frozen() -> bool:
+    """``True`` iff running inside a PyInstaller bundle. Centralised
+    so the rest of this module reads as flow, not as platform checks.
+    """
+    return bool(getattr(sys, "frozen", False))
+
+
+def overlay_root() -> Path:
+    """Persistent per-user base dir for the overlay ``src/`` tree.
+
+    Windows uses ``%LOCALAPPDATA%`` (falls back to ``%APPDATA%``).
+    macOS uses ``~/Library/Application Support``. Linux uses
+    ``$XDG_DATA_HOME`` or ``~/.local/share`` — included for parity
+    even though we don't ship a frozen Linux build today.
+
+    The dir is created lazily by callers; this function is pure
+    path construction.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if base:
+            return Path(base) / _OVERLAY_APP_NAME / _OVERLAY_DIRNAME
+        # Pathological env (no APPDATA either) — fall through to home.
+        return Path.home() / "AppData" / "Local" / _OVERLAY_APP_NAME / _OVERLAY_DIRNAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / _OVERLAY_APP_NAME / _OVERLAY_DIRNAME
+    # Linux / other.
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / _OVERLAY_APP_NAME / _OVERLAY_DIRNAME
+
+
+def overlay_src_dir() -> Path:
+    """The ``src/`` directory inside the overlay. ``apply_patch``
+    targets this in frozen builds; the entry stub seeds it from
+    ``_MEIPASS`` on first launch.
+    """
+    return overlay_root() / "src"
+
+
+def _meipass_src_dir() -> Optional[Path]:
+    """Return ``<_MEIPASS>/src`` if it exists, else ``None``.
+    Lets callers reseed the overlay from the freshly-installed
+    baseline that PyInstaller laid down at install time.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return None
+    p = Path(base) / "src"
+    return p if p.is_dir() else None
+
+
+def seed_overlay_from_meipass(*, force: bool = False) -> Optional[Path]:
+    """Copy ``_MEIPASS/src`` → overlay ``src/`` so the first
+    post-install launch (or a launch after the customer reinstalled
+    a newer .exe) has a fully-populated overlay to patch into.
+
+    Returns the overlay ``src/`` path on success, ``None`` if seeding
+    didn't run (not frozen, no _MEIPASS, or overlay already present
+    and ``force`` is False).
+
+    ``force=True`` is used when the entry stub detects that the
+    installer's ``BRAND.version`` is newer than the overlay's — in
+    that case the fresh .exe wins and we throw away the stale
+    overlay first. See ``_pyinstaller_entry.py``.
+    """
+    if not is_frozen():
+        return None
+    src = _meipass_src_dir()
+    if src is None:
+        return None
+    dest = overlay_src_dir()
+    if dest.is_dir() and not force:
+        # Overlay already seeded — nothing to do.
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        # Old seed about to be replaced. ``shutil.rmtree`` tolerates
+        # read-only files on Windows via ``onerror`` chmod, but a
+        # plain rmtree is fine for our case — the overlay only ever
+        # contains files we wrote ourselves.
+        shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(src, dest)
+    log.info("auto-update: seeded overlay src from _MEIPASS → %s", dest)
+    return dest
+
+
 # ── data classes ────────────────────────────────────────────────
 
 
@@ -399,9 +513,28 @@ def apply_patch(
     Steps 1-2 fail before mutating the live install.
     """
     if src_dir is None:
-        # Default: this module's parent directory IS src/. Walk up
-        # one level to find it.
-        src_dir = Path(__file__).resolve().parent
+        # Default depends on whether we're running from a PyInstaller
+        # bundle. Source mode patches the live tree (the module's own
+        # parent dir). Frozen mode patches the persistent overlay
+        # under %LOCALAPPDATA% / ~/Library/Application Support — see
+        # ``overlay_src_dir`` for the rationale (``_MEIPASS`` is a
+        # temp dir wiped on next launch).
+        if is_frozen():
+            src_dir = overlay_src_dir()
+            if not src_dir.is_dir():
+                # Entry stub should have seeded the overlay before
+                # any apply ever runs. If it didn't, try to recover
+                # by seeding now so the apply has a tree to swap.
+                seeded = seed_overlay_from_meipass(force=False)
+                if seeded is None:
+                    raise UpdateError(
+                        "overlay src dir missing and could not be "
+                        f"seeded from _MEIPASS: {src_dir}"
+                    )
+                src_dir = seeded
+        else:
+            # Source mode: this module's parent IS src/.
+            src_dir = Path(__file__).resolve().parent
     src_dir = src_dir.resolve()
 
     if src_dir.name != "src":
@@ -510,12 +643,37 @@ def relaunch() -> None:
     runs at a clean PID -- some macOS Tk widgets get sticky if we
     swap the executable mid-mainloop. Exit happens AFTER spawn
     succeeds so a failed relaunch leaves the old build running.
+
+    Frozen vs source argv
+    ---------------------
+    Old code unconditionally used ``[sys.executable, "-m", "src.main",
+    "--studio"]``. That's correct in source mode but **wrong in a
+    PyInstaller bundle**: ``sys.executable`` there is the .exe / .app
+    launcher itself, and the bootloader forwards every argv element
+    to the entry stub. ``-m src.main`` then reaches ``argparse``,
+    which rejects ``-m`` as an unknown flag and ``SystemExit(2)``
+    kills the child before any window paints — the customer sees
+    the app close and nothing replace it.
+
+    Now: frozen builds spawn the launcher with no args; the entry
+    stub already injects ``--studio`` when argv is empty. Source
+    mode keeps its explicit ``-m src.main --studio`` so a dev who
+    runs ``python -m src.main`` still gets the same relaunch path.
     """
-    args = [sys.executable, "-m", "src.main", "--studio"]
+    if is_frozen():
+        # PyInstaller: sys.executable IS the GUI launcher. cwd is
+        # the dir holding the .exe / .app so any relative tool
+        # paths the new process resolves match what the install dir
+        # holds.
+        args = [sys.executable]
+        cwd = str(Path(sys.executable).resolve().parent)
+    else:
+        args = [sys.executable, "-m", "src.main", "--studio"]
+        cwd = str(Path(__file__).resolve().parent.parent)
     try:
         subprocess.Popen(
             args,
-            cwd=str(Path(__file__).resolve().parent.parent),
+            cwd=cwd,
             **platform_tools.subprocess_kwargs(),
         )
     except OSError as exc:
