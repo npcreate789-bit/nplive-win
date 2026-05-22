@@ -535,6 +535,18 @@ class DashboardPage(ctk.CTkFrame):
         # progress callbacks per second × N devices = sidebar
         # destroy/rebuild storm + flicker + lost hover state).
         self._device_sub_labels: dict[str, ctk.CTkLabel] = {}
+        # v1.8.19: same idea for the online/offline dot. Together
+        # with ``_device_sub_labels`` this lets the 2 s device poll
+        # update each row in-place via ``_refresh_sidebar_rows()``
+        # instead of tearing the entire sidebar down and rebuilding
+        # — which the user perceived as a constant flicker on the
+        # left panel.
+        self._device_dots: dict[str, ctk.CTkLabel] = {}
+        # Ordered snapshot of the serials currently rendered. Used
+        # by ``on_devices_changed`` to decide between the cheap
+        # per-row update and a full rebuild (when the set or order
+        # of devices changes).
+        self._sidebar_serial_order: tuple[str, ...] = ()
         self._refresh_sidebar()
 
     def _refresh_sidebar(self) -> None:
@@ -544,8 +556,10 @@ class DashboardPage(ctk.CTkFrame):
             w.destroy()
         self._device_buttons.clear()
         self._device_sub_labels.clear()
+        self._device_dots.clear()
 
         entries = self.app.devices_lib.list()
+        self._sidebar_serial_order = tuple(e.serial for e in entries)
         if not entries:
             ctk.CTkLabel(
                 self.devices_scroll,
@@ -639,6 +653,10 @@ class DashboardPage(ctk.CTkFrame):
             font=ctk.CTkFont(size=14),
         )
         dot.grid(row=0, column=0, rowspan=2, padx=(0, 8))
+        # v1.8.19: per-serial reference so the 2 s device poll can
+        # flip the dot colour in-place when a phone goes online or
+        # offline, instead of triggering a full sidebar rebuild.
+        self._device_dots[entry.serial] = dot
 
         title_lbl = ctk.CTkLabel(
             inner,
@@ -745,6 +763,53 @@ class DashboardPage(ctk.CTkFrame):
         if task is not None:
             sub = f"{sub} · {task.status_label_thai()}"
         return sub
+
+    def _refresh_sidebar_rows(self) -> bool:
+        """Cheap per-row update — no widget destroy/recreate.
+
+        For each serial in the currently-rendered ``_sidebar_serial_order``
+        snapshot, refresh:
+          * the dot's online/offline colour
+          * the sub-line text (encode badge, LIVE timer, transport,
+            drift warning — everything ``_compute_sidebar_sub`` knows)
+
+        Returns ``True`` if the cheap path completed; ``False`` if any
+        widget reference was missing, in which case the caller should
+        fall back to :meth:`_refresh_sidebar`. We never partially
+        update — bailing on the first miss keeps the sidebar internally
+        consistent.
+
+        Background (v1.8.19): pre-fix, ``on_devices_changed`` did a
+        full sidebar wipe + rebuild every 2 s on the device-poll
+        cadence. With even a few devices that produced visible flicker,
+        lost hover state, and constant scrollbar jitter on the left
+        panel. The full rebuild remains for the cases that actually
+        need it (add / remove / reorder); steady-state polling now
+        comes through here.
+        """
+        for serial in self._sidebar_serial_order:
+            entry = self.app.devices_lib.get(serial)
+            dot = self._device_dots.get(serial)
+            sub_lbl = self._device_sub_labels.get(serial)
+            if entry is None or dot is None or sub_lbl is None:
+                return False
+            try:
+                online = self.app.is_online(serial)
+                dot.configure(
+                    text_color=(
+                        THEME.online_dot if online else THEME.offline_dot
+                    ),
+                )
+                sub_lbl.configure(
+                    text=self._compute_sidebar_sub(entry, online=online),
+                )
+            except Exception:
+                log.debug(
+                    "sidebar cheap row update failed for %s", serial,
+                    exc_info=True,
+                )
+                return False
+        return True
 
     def _refresh_sidebar_badge_for(self, serial: str) -> None:
         """Cheap badge refresh — just recompute one row's sub-text.
@@ -2082,7 +2147,24 @@ class DashboardPage(ctk.CTkFrame):
     # ── poller hooks ─────────────────────────────────────────────
 
     def on_devices_changed(self) -> None:
-        self._refresh_sidebar()
+        # v1.8.19: this fires on the 2 s device-poll cadence. Doing
+        # a full sidebar wipe + rebuild at that rate produced a
+        # visible flicker on the left panel and trashed hover state
+        # for the customer. Take the cheap per-row path whenever the
+        # set + order of devices hasn't changed; fall back to a full
+        # rebuild for actual structural changes (add / remove /
+        # reorder) where widget identities have to change anyway.
+        current_serials = tuple(
+            e.serial for e in self.app.devices_lib.list()
+        )
+        if (
+            current_serials
+            and current_serials == self._sidebar_serial_order
+            and self._refresh_sidebar_rows()
+        ):
+            pass  # cheap update succeeded — no rebuild needed
+        else:
+            self._refresh_sidebar()
         self._refresh_main()
         # Cheap throttled probe -- only re-checks when the cache
         # is older than 8 s. Idempotent across the 2 s adb-devices
