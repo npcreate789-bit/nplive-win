@@ -71,6 +71,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from . import platform_tools
+
 log = logging.getLogger(__name__)
 
 
@@ -302,6 +304,7 @@ def _adb(
     try:
         r = subprocess.run(
             base + args, capture_output=True, text=True, timeout=timeout,
+            **platform_tools.subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired:
         return None, "timeout"

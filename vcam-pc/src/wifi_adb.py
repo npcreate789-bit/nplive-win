@@ -41,6 +41,8 @@ import re
 import shutil
 import subprocess
 
+from . import platform_tools
+
 log = logging.getLogger(__name__)
 
 DEFAULT_TCPIP_PORT = 5555
@@ -79,6 +81,7 @@ def _run(
         text=True,
         timeout=timeout,
         check=False,
+        **platform_tools.subprocess_kwargs(),
     )
 
 
@@ -232,6 +235,7 @@ def adb_pair(
             text=True,
             timeout=timeout,
             check=False,
+            **platform_tools.subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired:
         log.warning("adb pair %s timed out", target)

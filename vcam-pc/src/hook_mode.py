@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import platform_tools
 from .config import DeviceProfile, StreamConfig
 
 # Type alias: ``progress_cb(percent_0_to_1, status_text)``. Callers
@@ -276,6 +277,7 @@ class HookModePipeline:
                     ],
                     capture_output=True, text=True,
                     timeout=15, check=False,
+                    **platform_tools.subprocess_kwargs(),
                 )
                 val = (res.stdout or "").strip()
                 if val:
@@ -289,6 +291,7 @@ class HookModePipeline:
                 [ffmpeg, "-hide_banner", "-i", str(p)],
                 capture_output=True, text=True,
                 timeout=15, check=False,
+                **platform_tools.subprocess_kwargs(),
             )
             stderr = res.stderr or ""
             for line in stderr.splitlines():
@@ -357,6 +360,7 @@ class HookModePipeline:
                     res = subprocess.run(
                         stat_cmd, capture_output=True, text=True,
                         timeout=4, check=False,
+                        **platform_tools.subprocess_kwargs(),
                     )
                 except (subprocess.TimeoutExpired, OSError):
                     continue
@@ -662,6 +666,7 @@ class HookModePipeline:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                **platform_tools.subprocess_kwargs(),
             )
         except OSError as exc:
             return HookEncodeResult(
@@ -843,7 +848,8 @@ class HookModePipeline:
         mkdir_cmd += ["shell", "mkdir", "-p", parent_dir]
         try:
             subprocess.run(mkdir_cmd, capture_output=True, text=True,
-                           timeout=5, check=False)
+                           timeout=5, check=False,
+                           **platform_tools.subprocess_kwargs())
         except subprocess.TimeoutExpired:
             pass
 
@@ -887,6 +893,7 @@ class HookModePipeline:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
+                **platform_tools.subprocess_kwargs(),
             )
         except OSError as exc:
             stop_evt.set()
@@ -1021,7 +1028,8 @@ class HookModePipeline:
             cmd += ["--ez", "audioReload", "true"]
         try:
             subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=5, check=False)
+                           timeout=5, check=False,
+                           **platform_tools.subprocess_kwargs())
         except subprocess.TimeoutExpired:
             log.debug("force-reload broadcast timed out (harmless)")
 
@@ -1121,7 +1129,8 @@ class HookModePipeline:
         ]
         try:
             subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=5, check=False)
+                           timeout=5, check=False,
+                           **platform_tools.subprocess_kwargs())
         except subprocess.TimeoutExpired:
             log.debug("broadcast_flip_transform_to_tiktok timed out")
 
@@ -1187,6 +1196,7 @@ class HookModePipeline:
             subprocess.run(
                 prep_cmd, capture_output=True, text=True,
                 timeout=5, check=False,
+                **platform_tools.subprocess_kwargs(),
             )
         except subprocess.TimeoutExpired:
             pass
@@ -1203,6 +1213,7 @@ class HookModePipeline:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=120, check=False,
+                **platform_tools.subprocess_kwargs(),
             )
         except subprocess.TimeoutExpired:
             return HookPushResult(
@@ -1236,6 +1247,7 @@ class HookModePipeline:
             subprocess.run(
                 public_prep, capture_output=True, text=True,
                 timeout=5, check=False,
+                **platform_tools.subprocess_kwargs(),
             )
         except subprocess.TimeoutExpired:
             pass
@@ -1248,6 +1260,7 @@ class HookModePipeline:
             subprocess.run(
                 public_push, capture_output=True, text=True,
                 timeout=120, check=False,
+                **platform_tools.subprocess_kwargs(),
             )
         except subprocess.TimeoutExpired:
             log.warning("public-mirror push timed out (file still available at %s)", target)
@@ -1264,6 +1277,7 @@ class HookModePipeline:
             subprocess.run(
                 scan_cmd, capture_output=True, text=True,
                 timeout=5, check=False,
+                **platform_tools.subprocess_kwargs(),
             )
         except subprocess.TimeoutExpired:
             pass
@@ -1302,7 +1316,8 @@ class HookModePipeline:
         ]
         try:
             subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=5, check=False)
+                           timeout=5, check=False,
+                           **platform_tools.subprocess_kwargs())
         except subprocess.TimeoutExpired:
             return False
         # Trigger a reload so AudioFeeder switches back to MP4 audio.
@@ -1332,7 +1347,8 @@ class HookModePipeline:
             cmd += ["shell", "rm", "-f", ENABLED_FLAG_PATH]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=5, check=False)
+                               timeout=5, check=False,
+                               **platform_tools.subprocess_kwargs())
         except subprocess.TimeoutExpired:
             log.warning("adb shell timeout while toggling enabled flag")
             return False
@@ -1380,7 +1396,8 @@ class HookModePipeline:
         ]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=8, check=False)
+                               timeout=8, check=False,
+                               **platform_tools.subprocess_kwargs())
         except subprocess.TimeoutExpired:
             log.warning("set_mode broadcast timed out")
             return False
@@ -1407,7 +1424,8 @@ class HookModePipeline:
             args += ["shell", cmd]
             try:
                 r = subprocess.run(args, capture_output=True, text=True,
-                                   timeout=5, check=False)
+                                   timeout=5, check=False,
+                                   **platform_tools.subprocess_kwargs())
             except subprocess.TimeoutExpired:
                 return ""
             return (r.stdout or "").strip()

@@ -37,6 +37,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import platform_tools
+
 # Ensure stdout/stderr accept UTF-8 (CTk + Thai labels rely on this).
 # On older Python the default cmd encoder is cp874 and would crash
 # the moment we print a Thai character.
@@ -114,6 +116,7 @@ def _run_pip_install() -> int:
             res = subprocess.run(
                 cmd, stdout=fh, stderr=subprocess.STDOUT,
                 check=False,
+                **platform_tools.subprocess_kwargs(),
             )
     except OSError as exc:
         _print_thai(

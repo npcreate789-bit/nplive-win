@@ -212,6 +212,7 @@ class LSPatchPipeline:
                     [str(paths.java), "-version"],
                     capture_output=True, text=True,
                     timeout=5, check=False,
+                    **platform_tools.subprocess_kwargs(),
                 )
                 # `java -version` writes to stderr.
                 vline = (r.stderr or r.stdout or "").splitlines()
@@ -383,7 +384,8 @@ class LSPatchPipeline:
                 cmd += ["-s", serial]
             cmd += ["pull", p, str(dst)]
             r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=180, check=False)
+                               timeout=180, check=False,
+                               **platform_tools.subprocess_kwargs())
             if r.returncode != 0:
                 err = (r.stderr or r.stdout or "").strip().splitlines()[-2:]
                 return PullResult(False, package=package,
@@ -471,6 +473,7 @@ class LSPatchPipeline:
                              "assets/lspatch/origin.apk"],
                             stdout=dst, stderr=subprocess.PIPE,
                             check=False, timeout=120,
+                            **platform_tools.subprocess_kwargs(),
                         )
                     if proc.returncode != 0 or tmp.stat().st_size == 0:
                         raise RuntimeError(
@@ -581,7 +584,8 @@ class LSPatchPipeline:
             t0 = time.monotonic()
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True,
-                                      timeout=600, check=False, env=env)
+                                      timeout=600, check=False, env=env,
+                                      **platform_tools.subprocess_kwargs())
             except subprocess.TimeoutExpired:
                 return PatchResult(False, self.patched_dir,
                                    elapsed_s=time.monotonic() - t0,
@@ -619,6 +623,7 @@ class LSPatchPipeline:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1, env=env,
+                **platform_tools.subprocess_kwargs(),
             )
         except OSError as exc:
             return PatchResult(False, self.patched_dir,
@@ -777,7 +782,8 @@ class LSPatchPipeline:
                 cmd += ["-s", serial]
             cmd += ["uninstall", package]
             subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=30, check=False)
+                           timeout=30, check=False,
+                           **platform_tools.subprocess_kwargs())
 
         # Step 2: install-multiple the entire patched bundle.
         _fire_progress(
@@ -790,7 +796,8 @@ class LSPatchPipeline:
         cmd += ["install-multiple", "-r", *[str(p) for p in patched_apks]]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=600, check=False)
+                               timeout=600, check=False,
+                               **platform_tools.subprocess_kwargs())
         except subprocess.TimeoutExpired:
             return self._rollback_install(
                 package=package,
@@ -896,6 +903,7 @@ class LSPatchPipeline:
             r = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=600, check=False,
+                **platform_tools.subprocess_kwargs(),
             )
         except subprocess.TimeoutExpired:
             return InstallResult(
@@ -983,7 +991,8 @@ class LSPatchPipeline:
         args += ["shell", cmd]
         try:
             r = subprocess.run(args, capture_output=True, text=True,
-                               timeout=10, check=False)
+                               timeout=10, check=False,
+                               **platform_tools.subprocess_kwargs())
         except subprocess.TimeoutExpired:
             return ""
         return (r.stdout or "").strip()

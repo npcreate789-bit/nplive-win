@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import platform_tools
+
 log = logging.getLogger(__name__)
 
 # Order matters — we try them in this order until pm list packages
@@ -135,6 +137,7 @@ class TikTokAutoController:
             r = subprocess.run(
                 [self.adb_path, *args],
                 capture_output=True, text=True, timeout=timeout,
+                **platform_tools.subprocess_kwargs(),
             )
             return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
         except subprocess.TimeoutExpired:

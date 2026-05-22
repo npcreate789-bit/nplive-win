@@ -38,6 +38,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
 
+from .. import platform_tools
 from ..branding import BRAND, THEME
 from ..customer_devices import DeviceEntry
 from ..encode_push_runner import run_encode_push
@@ -2942,6 +2943,7 @@ class DashboardPage(ctk.CTkFrame):
             r = subprocess.run(
                 [adb, "-s", adb_id, "get-state"],
                 capture_output=True, text=True, timeout=2.0,
+                **platform_tools.subprocess_kwargs(),
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             log.warning("adb get-state %s timed out / not found", adb_id)
@@ -4371,6 +4373,7 @@ class DashboardPage(ctk.CTkFrame):
             r = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=30, check=False,
+                **platform_tools.subprocess_kwargs(),
             )
         except subprocess.TimeoutExpired:
             self.after(0, lambda: messagebox.showerror(
@@ -4510,6 +4513,7 @@ class DashboardPage(ctk.CTkFrame):
                  "-a", "android.intent.action.VIEW",
                  "-d", intent_uri],
                 capture_output=True, text=True, timeout=15, check=False,
+                **platform_tools.subprocess_kwargs(),
             )
             if r.returncode != 0:
                 log.warning("Play Store launch returncode=%s stderr=%r",
@@ -4523,6 +4527,7 @@ class DashboardPage(ctk.CTkFrame):
                      "-d",
                      f"https://play.google.com/store/search?q={query}"],
                     capture_output=True, text=True, timeout=15, check=False,
+                    **platform_tools.subprocess_kwargs(),
                 )
             messagebox.showinfo(
                 "เปิด Play Store แล้ว",

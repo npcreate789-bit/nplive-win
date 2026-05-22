@@ -69,17 +69,6 @@ from . import platform_tools
 
 log = logging.getLogger(__name__)
 
-# Hide the cmd flicker on Windows when we spawn mediamtx. Same
-# trick UltimateRerun uses; without it customers see a black
-# console window pop briefly every time the server starts, which
-# looks broken even though it's not.
-_NO_WINDOW = (
-    subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-    if sys.platform == "win32"
-    else 0
-)
-
-
 _DEFAULT_RTMP_PORT = 1935
 
 
@@ -171,12 +160,13 @@ def _kill_stale_mediamtx() -> None:
             subprocess.run(
                 ["taskkill", "/F", "/IM", name],
                 capture_output=True, timeout=5,
-                creationflags=_NO_WINDOW,
+                **platform_tools.subprocess_kwargs(),
             )
         else:
             subprocess.run(
                 ["pkill", "-f", name],
                 capture_output=True, timeout=5,
+                **platform_tools.subprocess_kwargs(),
             )
     except Exception:
         log.debug("kill stale mediamtx: ignoring failure", exc_info=True)
@@ -272,7 +262,7 @@ class RTMPServer:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                creationflags=_NO_WINDOW,
+                **platform_tools.subprocess_kwargs(),
             )
         except OSError as e:
             self._emit(f"❌ เปิด mediamtx ล้มเหลว: {e}")

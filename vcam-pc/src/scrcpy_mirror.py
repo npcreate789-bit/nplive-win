@@ -296,6 +296,7 @@ def start_mirror(
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            **platform_tools.subprocess_kwargs(),
         )
     except (FileNotFoundError, OSError) as exc:
         log.warning("scrcpy spawn failed: %s", exc)

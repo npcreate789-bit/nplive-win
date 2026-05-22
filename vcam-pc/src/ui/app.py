@@ -17,6 +17,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from .. import platform_tools
 from ..adb import AdbController
 from ..config import PROJECT_ROOT, ProfileLibrary, StreamConfig
 from ..health import HealthMonitor
@@ -668,6 +669,7 @@ class VcamApp(tk.Tk):
             r = subprocess.run(
                 [self.cfg.adb_path, "shell", "pm", "list", "packages", self.APK_PACKAGE],
                 capture_output=True, text=True, timeout=4,
+                **platform_tools.subprocess_kwargs(),
             )
             return self.APK_PACKAGE in (r.stdout or "")
         except Exception:
@@ -696,6 +698,7 @@ class VcamApp(tk.Tk):
             r = subprocess.run(
                 [self.cfg.adb_path, "install", "-r", "-g", str(self.APK_PATH)],
                 capture_output=True, text=True, timeout=120,
+                **platform_tools.subprocess_kwargs(),
             )
             ok = r.returncode == 0 and "Success" in (r.stdout or "")
             msg = (r.stdout or "") + (r.stderr or "")
@@ -753,6 +756,7 @@ class VcamApp(tk.Tk):
                     "--ez", "vcam_live", "true",
                 ],
                 capture_output=True, text=True, timeout=8,
+                **platform_tools.subprocess_kwargs(),
             )
             # 2. give the activity ~2 s to switch into Live Mode and
             # the streamer pipeline a beat to feed the first frame.
@@ -826,6 +830,7 @@ class VcamApp(tk.Tk):
                     f"{self.APK_PACKAGE}/.MainActivity",
                 ],
                 capture_output=True, text=True, timeout=8,
+                **platform_tools.subprocess_kwargs(),
             )
             # Give the activity a moment to inflate before auto-tapping.
             time.sleep(1.2)
@@ -834,6 +839,7 @@ class VcamApp(tk.Tk):
             subprocess.run(
                 [self.cfg.adb_path, "shell", "input", "tap", str(tx), str(ty)],
                 capture_output=True, text=True, timeout=4,
+                **platform_tools.subprocess_kwargs(),
             )
         except Exception:
             log.exception("auto-launch failed")
@@ -848,10 +854,12 @@ class VcamApp(tk.Tk):
                     "dump", "/sdcard/vcam_ui.xml",
                 ],
                 capture_output=True, text=True, timeout=5,
+                **platform_tools.subprocess_kwargs(),
             )
             r = subprocess.run(
                 [self.cfg.adb_path, "shell", "cat", "/sdcard/vcam_ui.xml"],
                 capture_output=True, text=True, timeout=5,
+                **platform_tools.subprocess_kwargs(),
             )
             xml = r.stdout or ""
             # Find first node with our btn_start id.
@@ -880,6 +888,7 @@ class VcamApp(tk.Tk):
             out = subprocess.run(
                 [self.cfg.adb_path, "shell", "wm", "size"],
                 capture_output=True, text=True, timeout=3,
+                **platform_tools.subprocess_kwargs(),
             ).stdout.strip()
             for line in out.splitlines():
                 if "Physical size:" in line:
@@ -1113,20 +1122,23 @@ class VcamApp(tk.Tk):
                 if serial: cmd += ["-s", serial]
                 cmd += ["reverse", f"tcp:{self.cfg.tcp_port}",
                         f"tcp:{self.cfg.tcp_port}"]
-                subprocess.run(cmd, capture_output=True, timeout=5)
+                subprocess.run(cmd, capture_output=True, timeout=5,
+                               **platform_tools.subprocess_kwargs())
                 # Touch the activation flag.
                 cmd2 = [adb]
                 if serial: cmd2 += ["-s", serial]
                 cmd2 += ["shell", "touch",
                          "/data/local/tmp/vcam_stream_url"]
-                subprocess.run(cmd2, capture_output=True, timeout=5)
+                subprocess.run(cmd2, capture_output=True, timeout=5,
+                               **platform_tools.subprocess_kwargs())
                 # Also force-stop TikTok so the new createInputSurface
                 # picks up the live path next time it goes Live.
                 cmd3 = [adb]
                 if serial: cmd3 += ["-s", serial]
                 cmd3 += ["shell", "am", "force-stop",
                          "com.ss.android.ugc.trill"]
-                subprocess.run(cmd3, capture_output=True, timeout=5)
+                subprocess.run(cmd3, capture_output=True, timeout=5,
+                               **platform_tools.subprocess_kwargs())
                 self._live_stream_var.set(
                     T("Live-stream mode: ON (PC → phone over TCP)")
                 )
@@ -1135,7 +1147,8 @@ class VcamApp(tk.Tk):
                 if serial: cmd += ["-s", serial]
                 cmd += ["shell", "rm", "-f",
                         "/data/local/tmp/vcam_stream_url"]
-                subprocess.run(cmd, capture_output=True, timeout=5)
+                subprocess.run(cmd, capture_output=True, timeout=5,
+                               **platform_tools.subprocess_kwargs())
                 self._live_stream_var.set(
                     T("Live-stream mode: OFF (using MP4 loop)")
                 )

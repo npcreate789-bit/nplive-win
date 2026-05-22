@@ -51,6 +51,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
 
+from . import platform_tools
+
 log = logging.getLogger(__name__)
 
 
@@ -443,6 +445,7 @@ def _adb_shell(
         r = subprocess.run(
             base_cmd + ["shell", shell_cmd],
             capture_output=True, text=True, timeout=timeout,
+            **platform_tools.subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired:
         return None, f"timeout running: {shell_cmd}"

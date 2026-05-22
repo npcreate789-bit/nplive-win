@@ -238,6 +238,7 @@ def _system_info() -> dict:
             r = subprocess.run(
                 [str(adb_path), "version"],
                 capture_output=True, text=True, timeout=4,
+                **platform_tools.subprocess_kwargs(),
             )
             info["adb_path"] = str(adb_path)
             info["adb_version"] = (

@@ -18,6 +18,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import platform_tools
 from .config import DeviceProfile, StreamConfig
 
 log = logging.getLogger(__name__)
@@ -112,6 +113,7 @@ class FFmpegStreamer:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            **platform_tools.subprocess_kwargs(),
         )
         self.stats = StreamerStats(pid=self.process.pid, running=True)
         return self.process

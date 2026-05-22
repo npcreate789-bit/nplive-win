@@ -50,6 +50,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -514,6 +515,41 @@ def find_vcam_apk() -> Path | None:
 
 
 # ── subprocess env ───────────────────────────────────────────────
+
+
+# Windows console-flicker suppressor.
+#
+# PyInstaller GUI builds (--noconsole) have no console of their own,
+# so spawning any console-subsystem child (adb.exe, ffmpeg.exe,
+# java.exe, scrcpy.exe, …) allocates a brand-new black console
+# window for the child process. On Windows the window is visible for
+# the few milliseconds the child takes to start, which the customer
+# sees as the program "flickering" — most painfully every 2 s while
+# the device poller runs `adb devices` in the background.
+#
+# CREATE_NO_WINDOW tells CreateProcess to skip the console
+# allocation entirely. Defined to 0 on non-Windows so the kwargs
+# helper below is a no-op there.
+NO_WINDOW_FLAGS = (
+    subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    if sys.platform == "win32"
+    else 0
+)
+
+
+def subprocess_kwargs() -> dict:
+    """Kwargs that every ``subprocess.run`` / ``subprocess.Popen``
+    in this codebase should splat in so children don't flash a
+    console window on Windows. No-op on macOS / Linux.
+
+    Usage::
+
+        subprocess.run(cmd, capture_output=True, timeout=5,
+                       **platform_tools.subprocess_kwargs())
+    """
+    if sys.platform == "win32":
+        return {"creationflags": NO_WINDOW_FLAGS}
+    return {}
 
 
 def make_subprocess_env(extra_path: list[Path] | None = None) -> dict[str, str]:

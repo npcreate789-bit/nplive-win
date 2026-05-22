@@ -95,6 +95,8 @@ class AdbController:
     # ── plumbing ────────────────────────────────────────────────
 
     def _run(self, *args: str, timeout: float = 10.0) -> subprocess.CompletedProcess:
+        from . import platform_tools
+
         cmd = [self.adb_path, *args]
         log.debug("adb: %s", " ".join(cmd))
         return subprocess.run(
@@ -103,6 +105,7 @@ class AdbController:
             text=True,
             timeout=timeout,
             check=False,
+            **platform_tools.subprocess_kwargs(),
         )
 
     def is_available(self) -> bool:

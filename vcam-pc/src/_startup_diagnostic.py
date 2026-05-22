@@ -169,6 +169,7 @@ def _write_unsafe(log_dir: Path | None) -> Path | None:
                     capture_output=True,
                     text=True,
                     timeout=5,
+                    **platform_tools.subprocess_kwargs(),
                 )
                 kv("adb version returncode", r.returncode)
                 kv("adb version stdout", (r.stdout or "").strip()[:300])
@@ -185,6 +186,7 @@ def _write_unsafe(log_dir: Path | None) -> Path | None:
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    **platform_tools.subprocess_kwargs(),
                 )
                 kv("adb devices returncode", r.returncode)
                 kv("adb devices stdout", (r.stdout or "").strip()[:500])

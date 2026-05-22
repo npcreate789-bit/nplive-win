@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import _ed25519
+from . import platform_tools
 from ._pubkey import PUBLIC_KEY_HEX
 from .branding import BRAND
 
@@ -512,7 +513,11 @@ def relaunch() -> None:
     """
     args = [sys.executable, "-m", "src.main", "--studio"]
     try:
-        subprocess.Popen(args, cwd=str(Path(__file__).resolve().parent.parent))
+        subprocess.Popen(
+            args,
+            cwd=str(Path(__file__).resolve().parent.parent),
+            **platform_tools.subprocess_kwargs(),
+        )
     except OSError as exc:
         log.exception("relaunch spawn failed: %s", exc)
         return
