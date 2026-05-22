@@ -8,7 +8,7 @@
     </MappedFolder>
   </MappedFolders>
   <LogonCommand>
-    <Command>cmd.exe /c start "" "C:\Users\WDAGUtilityAccount\Desktop\installer\NP-Create-Setup-1.8.17.exe"</Command>
+    <Command>cmd.exe /c start "" "C:\Users\WDAGUtilityAccount\Desktop\installer\NP-Create-Setup-1.8.18.exe"</Command>
   </LogonCommand>
   <MemoryInMB>4096</MemoryInMB>
 </Configuration>
