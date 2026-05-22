@@ -21,8 +21,8 @@ Workflow
    ``DEFAULT_MANIFEST_URL`` from ``src/auto_update.py``. With GitHub
    Pages the easy path is::
 
-       cp dist/updates/manifest.json npcreate.github.io/updates/manifest.json
-       cp dist/updates/npcreate-src-1.5.1.zip npcreate.github.io/updates/
+       cp dist/updates/manifest.json npcreate789-bit.github.io/nplive/updates/manifest.json
+       cp dist/updates/npcreate-src-1.5.1.zip npcreate789-bit.github.io/nplive/updates/
 
    Pages serves the new manifest; customers' apps pick it up within
    the next 6 h poll cycle.
@@ -191,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--download-url-template",
-        default="https://npcreate.github.io/updates/npcreate-src-{version}.zip",
+        default="https://npcreate789-bit.github.io/nplive/updates/npcreate-src-{version}.zip",
         help=(
             "URL template where the patch ZIP will be uploaded. "
             "{version} is substituted from --version."
