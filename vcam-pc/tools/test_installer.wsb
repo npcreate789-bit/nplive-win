@@ -1,0 +1,14 @@
+<Configuration>
+  <Networking>Enable</Networking>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>C:\Users\nynum\Projects\nplive-win\vcam-pc\dist\installer</HostFolder>
+      <SandboxFolder>C:\Users\WDAGUtilityAccount\Desktop\installer</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>cmd.exe /c start "" "C:\Users\WDAGUtilityAccount\Desktop\installer\NP-Create-Setup-1.8.17.exe"</Command>
+  </LogonCommand>
+  <MemoryInMB>4096</MemoryInMB>
+</Configuration>
